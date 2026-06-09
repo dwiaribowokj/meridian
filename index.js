@@ -25,7 +25,7 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, getOpenPaperPositions, updatePaperPositionObservation } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -196,6 +196,52 @@ function stopCronJobs() {
   _cronTasks = [];
 }
 
+async function updatePaperPositions() {
+  const paperPositions = getOpenPaperPositions();
+  if (paperPositions.length === 0) return [];
+  const updated = [];
+  for (const p of paperPositions) {
+    try {
+      const active = await getActiveBin({ pool_address: p.pool });
+      const observed = updatePaperPositionObservation(p.position, {
+        active_bin: active.binId,
+        active_price: active.price,
+      });
+      if (observed) updated.push(observed);
+    } catch (error) {
+      log("state_warn", `Paper position update failed for ${p.position}: ${error.message}`);
+    }
+  }
+  return updated;
+}
+
+function formatPaperPositions(paperPositions) {
+  if (!paperPositions?.length) return "";
+  const latestByPool = new Map();
+  for (const p of paperPositions) {
+    const key = p.pool || p.position;
+    const prev = latestByPool.get(key);
+    const ts = new Date(p.deployed_at || 0).getTime();
+    const prevTs = new Date(prev?.deployed_at || 0).getTime();
+    if (!prev || ts >= prevTs) latestByPool.set(key, p);
+  }
+  const displayed = [...latestByPool.values()]
+    .sort((a, b) => new Date(b.deployed_at || 0).getTime() - new Date(a.deployed_at || 0).getTime())
+    .slice(0, 5);
+  const hiddenCount = Math.max(0, paperPositions.length - displayed.length);
+  const lines = displayed.map((p) => {
+    const pair = p.pool_name || p.pool?.slice?.(0, 8) || "paper";
+    const range = p.bin_range ? `${p.bin_range.min}→${p.bin_range.max}` : "?";
+    const pnl = p.price_change_pct == null ? "?" : `${p.price_change_pct}%`;
+    const status = p.status || "unknown";
+    const obs = p.observations?.length ?? 0;
+    const distance = p.bin_distance_to_range ? ` | dist: ${p.bin_distance_to_range} bin` : "";
+    return `**PAPER ${pair}** | PnL*: ${pnl} | ${status} | obs: ${obs} | bin ${p.last_active_bin ?? "?"} | range ${range}${distance}`;
+  });
+  if (hiddenCount > 0) lines.push(`…${hiddenCount} older/duplicate paper entries hidden`);
+  return `\n\nPaper positions (latest per pool, dry-run estimate, fee not included):\n${lines.join("\n")}`;
+}
+
 export async function runManagementCycle({ silent = false } = {}) {
   if (_managementBusy) return null;
   _managementBusy = true;
@@ -212,10 +258,12 @@ export async function runManagementCycle({ silent = false } = {}) {
     }
     const livePositions = await getMyPositions({ force: true }).catch(() => null);
     positions = livePositions?.positions || [];
+    const paperPositions = await updatePaperPositions();
+    const paperReport = formatPaperPositions(paperPositions);
 
     if (positions.length === 0) {
       log("cron", "No open positions — triggering screening cycle");
-      mgmtReport = "No open positions. Triggering screening cycle.";
+      mgmtReport = `No open positions.${paperReport}\n\nTriggering screening cycle.`;
       runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
       return mgmtReport;
     }
@@ -302,7 +350,8 @@ export async function runManagementCycle({ silent = false } = {}) {
 
     const cur = config.management.solMode ? "◎" : "$";
     mgmtReport = reportLines.join("\n\n") +
-      `\n\nSummary: 💼 ${positions.length} positions | ${cur}${totalValue.toFixed(4)} | fees: ${cur}${totalUnclaimed.toFixed(4)} | ${actionSummary}`;
+      `\n\nSummary: 💼 ${positions.length} positions | ${cur}${totalValue.toFixed(4)} | fees: ${cur}${totalUnclaimed.toFixed(4)} | ${actionSummary}` +
+      paperReport;
 
     // ── Call LLM only if action needed ──────────────────────────────
     const actionPositions = positionData.filter(p => {
@@ -1342,7 +1391,7 @@ async function deployLatestCandidate(index) {
     amount_y: deployAmount,
     strategy: config.strategy.strategy,
     bins_below: binsBelow,
-    bins_above: 0,
+    bins_above: config.strategy.upperBufferBins,
     pool_name: candidate.name,
     base_mint: candidate.base?.mint || candidate.base_mint || null,
     bin_step: candidate.bin_step,
@@ -1835,7 +1884,7 @@ Commands:
       await runBusy(async () => {
         console.log("\nAgent is picking and deploying...\n");
         const { content: reply } = await agentLoop(
-          `get_top_candidates and deploy only if a candidate is clearly worth it. If there is only one weak candidate, report NO DEPLOY. For a valid deploy, use amount_y=${DEPLOY}, amount_x=0, bins_above=0, and bins_below from positive volatility. Execute now, don't ask.`,
+          `get_top_candidates and deploy only if a candidate is clearly worth it. If there is only one weak candidate, report NO DEPLOY. For a valid deploy, use amount_y=${DEPLOY}, amount_x=0, bins_above=${config.strategy.upperBufferBins}, and bins_below from positive volatility. Execute now, don't ask.`,
           config.llm.maxSteps,
           [],
           "SCREENER"

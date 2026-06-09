@@ -111,6 +111,69 @@ export function trackPosition({
 }
 
 /**
+ * Record a dry-run deploy as a virtual paper position.
+ * This never represents an on-chain position; it is only for strategy observation.
+ */
+export function trackPaperPosition({
+  pool,
+  pool_name,
+  strategy,
+  bin_range = {},
+  amount_sol,
+  amount_x = 0,
+  active_bin,
+  bin_step,
+  volatility,
+  fee_tvl_ratio,
+  organic_score,
+  initial_value_usd,
+  active_price,
+  min_price,
+  max_price,
+  downside_coverage_pct,
+  upside_coverage_pct,
+  total_width_pct,
+}) {
+  const state = load();
+  if (!state.paperPositions) state.paperPositions = {};
+  const paperId = `paper:${pool}:${Date.now()}`;
+  state.paperPositions[paperId] = {
+    paper: true,
+    position: paperId,
+    pool,
+    pool_name,
+    strategy,
+    bin_range,
+    amount_sol,
+    amount_x,
+    active_bin_at_deploy: active_bin,
+    bin_step,
+    volatility,
+    fee_tvl_ratio,
+    initial_fee_tvl_24h: fee_tvl_ratio,
+    organic_score,
+    initial_value_usd,
+    active_price_at_deploy: active_price,
+    min_price,
+    max_price,
+    downside_coverage_pct,
+    upside_coverage_pct,
+    total_width_pct,
+    deployed_at: new Date().toISOString(),
+    last_observed_at: null,
+    last_active_bin: null,
+    last_active_price: null,
+    in_range: null,
+    price_change_pct: null,
+    notes: [],
+  };
+  pushEvent(state, { action: "paper_deploy", position: paperId, pool_name: pool_name || pool });
+  save(state);
+  log("state", `Tracked paper position: ${paperId} in pool ${pool}`);
+  return paperId;
+}
+
+/**
  * Mark a position as out of range (sets timestamp on first detection).
  */
 export function markOutOfRange(position_address) {
@@ -328,6 +391,95 @@ export function getTrackedPositions(openOnly = false) {
 export function getTrackedPosition(position_address) {
   const state = load();
   return state.positions[position_address] || null;
+}
+
+export function getOpenPaperPositions() {
+  const state = load();
+  return Object.values(state.paperPositions || {}).filter((p) => !p.closed);
+}
+
+function finiteNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function positiveNumber(value) {
+  const n = finiteNumber(value);
+  return n != null && n > 0 ? n : null;
+}
+
+function paperPriceScaleWarning(entryPrice, currentPrice) {
+  if (entryPrice == null || currentPrice == null) return null;
+  const hi = Math.max(entryPrice, currentPrice);
+  const lo = Math.min(entryPrice, currentPrice);
+  if (lo <= 0) return "invalid_price";
+  const ratio = hi / lo;
+  return ratio >= 100 ? `price_scale_mismatch:${Math.round(ratio * 100) / 100}x` : null;
+}
+
+export function updatePaperPositionObservation(position, observation) {
+  const state = load();
+  const pos = state.paperPositions?.[position];
+  if (!pos) return null;
+  const entryPrice = positiveNumber(pos.active_price_at_deploy);
+  const currentPrice = positiveNumber(observation.active_price);
+  const minPrice = positiveNumber(pos.min_price);
+  const maxPrice = positiveNumber(pos.max_price);
+  const currentBin = finiteNumber(observation.active_bin);
+  const minBin = finiteNumber(pos.bin_range?.min);
+  const maxBin = finiteNumber(pos.bin_range?.max);
+  const hasBinRange = currentBin != null && minBin != null && maxBin != null;
+  const hasPriceRange = currentPrice != null && minPrice != null && maxPrice != null;
+  const inRange = hasBinRange
+    ? currentBin >= minBin && currentBin <= maxBin
+    : hasPriceRange
+      ? currentPrice >= minPrice && currentPrice <= maxPrice
+      : null;
+  const status = inRange === true
+    ? "in_range"
+    : currentBin != null && maxBin != null && currentBin > maxBin
+      ? "out_above"
+      : currentBin != null && minBin != null && currentBin < minBin
+        ? "out_below"
+        : "unknown";
+  const binStep = positiveNumber(pos.bin_step);
+  const entryBin = finiteNumber(pos.active_bin_at_deploy);
+  const priceScaleWarning = paperPriceScaleWarning(entryPrice, currentPrice);
+  const priceChangePct = entryBin != null && currentBin != null && binStep != null
+    ? (Math.pow(1 + binStep / 10000, currentBin - entryBin) - 1) * 100
+    : !priceScaleWarning && entryPrice != null && currentPrice != null
+      ? ((currentPrice - entryPrice) / entryPrice) * 100
+      : null;
+  const binDistance = status === "out_above" ? currentBin - maxBin : status === "out_below" ? minBin - currentBin : 0;
+  pos.last_observed_at = new Date().toISOString();
+  pos.last_active_bin = currentBin;
+  pos.last_active_price = currentPrice;
+  pos.in_range = inRange;
+  pos.status = status;
+  pos.price_change_pct = priceChangePct == null ? null : Math.round(priceChangePct * 10000) / 10000;
+  pos.price_scale_warning = priceScaleWarning;
+  pos.price_change_source = entryBin != null && currentBin != null && binStep != null
+    ? "bin_step"
+    : !priceScaleWarning && entryPrice != null && currentPrice != null
+      ? "price"
+      : null;
+  pos.bin_distance_to_range = Number.isFinite(binDistance) ? binDistance : null;
+  if (!pos.observations) pos.observations = [];
+  pos.observations.push({
+    ts: pos.last_observed_at,
+    active_bin: currentBin,
+    active_price: currentPrice,
+    in_range: inRange,
+    status,
+    price_change_pct: pos.price_change_pct,
+    price_change_source: pos.price_change_source,
+    price_scale_warning: pos.price_scale_warning,
+    bin_distance_to_range: pos.bin_distance_to_range,
+  });
+  pos.observations = pos.observations.slice(-96);
+  pushEvent(state, { action: "paper_observe", position, status, price_change_pct: pos.price_change_pct, price_change_source: pos.price_change_source, price_scale_warning: pos.price_scale_warning });
+  save(state);
+  return pos;
 }
 
 /**

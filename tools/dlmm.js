@@ -15,6 +15,7 @@ import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { log } from "../logger.js";
 import {
   trackPosition,
+  trackPaperPosition,
   markOutOfRange,
   markInRange,
   recordClaim,
@@ -543,16 +544,38 @@ export async function deployPosition({
     throw new Error("Invalid deploy amount: provide a positive amount_y/amount_sol.");
   }
   const isSingleSidedSol = finalAmountX <= 0 && finalAmountY > 0;
-  if (isSingleSidedSol && (Number(bins_above ?? 0) > 0 || Number(upside_pct ?? 0) > 0)) {
+  const configuredUpperBuffer = Math.max(0, Number(config.strategy.upperBufferBins ?? 0));
+  const upperBufferDryRunOnly = config.strategy.upperBufferDryRunOnly !== false;
+  const requestedUpperBuffer = Math.max(Number(bins_above ?? 0), configuredUpperBuffer);
+  if (isSingleSidedSol && Number(upside_pct ?? 0) > 0) {
     throw new Error(
-      "Single-side SOL deploy cannot use bins_above or upside_pct. Use amount_y with bins_below only; the upper bin is the SDK active bin.",
+      "Single-side SOL deploy cannot use upside_pct. Use bins_below and optional configured upperBufferBins only.",
     );
   }
   if (isSingleSidedSol) {
-    activeBinsAbove = 0;
+    if (requestedUpperBuffer > 0 && upperBufferDryRunOnly && process.env.DRY_RUN !== "true") {
+      throw new Error("upperBufferBins is currently dry-run only. Set upperBufferDryRunOnly=false only after paper validation.");
+    }
+    activeBinsAbove = requestedUpperBuffer;
   }
   activeBinsBelow = Number(activeBinsBelow);
   activeBinsAbove = Number(activeBinsAbove);
+  const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
+  const fallbackBinsBelow = Number(bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow ?? minBinsBelow);
+  if (
+    isSingleSidedSol &&
+    Number.isFinite(fallbackBinsBelow) &&
+    Number.isInteger(fallbackBinsBelow) &&
+    fallbackBinsBelow >= minBinsBelow &&
+    Number.isFinite(activeBinsBelow) &&
+    activeBinsBelow < minBinsBelow
+  ) {
+    log(
+      "deploy",
+      `Single-side SOL range resolved to ${activeBinsBelow} bins; falling back to ${fallbackBinsBelow} bins_below to avoid tiny-range deploy`,
+    );
+    activeBinsBelow = fallbackBinsBelow;
+  }
   if (!Number.isFinite(activeBinsBelow) || !Number.isFinite(activeBinsAbove)) {
     throw new Error("Invalid bin range: bins_below and bins_above must be valid numbers.");
   }
@@ -562,7 +585,6 @@ export async function deployPosition({
   if (!Number.isInteger(activeBinsBelow) || !Number.isInteger(activeBinsAbove)) {
     throw new Error("Invalid bin range: bins_below and bins_above must be whole-bin integers.");
   }
-  const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
   const totalBins = activeBinsBelow + activeBinsAbove;
   if (totalBins < minBinsBelow) {
     throw new Error(
@@ -570,35 +592,12 @@ export async function deployPosition({
     );
   }
 
-  if (process.env.DRY_RUN === "true") {
-    return {
-      dry_run: true,
-      would_deploy: {
-        pool_address,
-        strategy: activeStrategy,
-        bins_below: activeBinsBelow,
-        bins_above: activeBinsAbove,
-        downside_pct: downside_pct ?? null,
-        upside_pct: upside_pct ?? null,
-        amount_x: finalAmountX,
-        amount_y: finalAmountY,
-        wide_range: totalBins > 69,
-      },
-      message: "DRY RUN — no transaction sent",
-    };
-  }
-
   const isWideRange = totalBins > 69;
   const minBinId = activeBin.binId - activeBinsBelow;
-  const maxBinId = isSingleSidedSol ? activeBin.binId : activeBin.binId + activeBinsAbove;
+  const maxBinId = activeBin.binId + activeBinsAbove;
 
   if (minBinId > maxBinId) {
     throw new Error(`Invalid bin range: ${minBinId} -> ${maxBinId}`);
-  }
-  if (isSingleSidedSol && maxBinId !== activeBin.binId) {
-    throw new Error(
-      `Single-side SOL deploy must end at the SDK active bin. Expected ${activeBin.binId}, got ${maxBinId}.`,
-    );
   }
 
   await assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, maxBinId);
@@ -608,6 +607,50 @@ export async function deployPosition({
   const downsideCoveragePct = activePrice > 0 ? ((activePrice - minPrice) / activePrice) * 100 : null;
   const upsideCoveragePct = activePrice > 0 ? ((maxPrice - activePrice) / activePrice) * 100 : null;
   const totalWidthPct = minPrice > 0 ? ((maxPrice - minPrice) / minPrice) * 100 : null;
+
+  if (process.env.DRY_RUN === "true") {
+    const paperPosition = trackPaperPosition({
+      pool: pool_address,
+      pool_name,
+      strategy: activeStrategy,
+      bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
+      amount_sol: finalAmountY,
+      amount_x: finalAmountX,
+      active_bin: activeBin.binId,
+      bin_step: actualBinStep,
+      volatility: normalizedVolatility,
+      fee_tvl_ratio,
+      organic_score,
+      initial_value_usd,
+      active_price: activePrice,
+      min_price: minPrice,
+      max_price: maxPrice,
+      downside_coverage_pct: downsideCoveragePct,
+      upside_coverage_pct: upsideCoveragePct,
+      total_width_pct: totalWidthPct,
+    });
+    return {
+      dry_run: true,
+      paper_position: paperPosition,
+      would_deploy: {
+        pool_address,
+        strategy: activeStrategy,
+        bins_below: activeBinsBelow,
+        bins_above: activeBinsAbove,
+        bin_range: { min: minBinId, max: maxBinId },
+        active_bin: activeBin.binId,
+        downside_pct: downside_pct ?? null,
+        upside_pct: upside_pct ?? null,
+        downside_coverage_pct: downsideCoveragePct,
+        upside_coverage_pct: upsideCoveragePct,
+        total_width_pct: totalWidthPct,
+        amount_x: finalAmountX,
+        amount_y: finalAmountY,
+        wide_range: totalBins > 69,
+      },
+      message: "DRY RUN — no transaction sent; paper position tracked",
+    };
+  }
 
   // Read base fee directly from pool — baseFactor * binStep / 10^6 gives fee in %
   const baseFactor = pool.lbPair.parameters?.baseFactor ?? 0;

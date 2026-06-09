@@ -127,6 +127,8 @@ export const config = {
     minBinsBelow: strategyMinBinsBelow,
     maxBinsBelow: strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
+    upperBufferBins: Math.max(0, Number(u.upperBufferBins ?? 0)),
+    upperBufferDryRunOnly: u.upperBufferDryRunOnly ?? true,
   },
 
   // ─── Scheduling ─────────────────────────

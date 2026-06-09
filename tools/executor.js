@@ -685,7 +685,7 @@ async function runSafetyChecks(name, args) {
         };
       }
       const requestedBinsBelow = Number(args.bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow);
-      const requestedBinsAbove = Number(args.bins_above ?? 0);
+      const requestedBinsAbove = Number(args.bins_above ?? config.strategy.upperBufferBins ?? 0);
       const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
       const isSingleSidedSol = deployAmountY > 0 && deployAmountX <= 0;
       const requestedTotalBins = requestedBinsBelow + requestedBinsAbove;
@@ -727,11 +727,22 @@ async function runSafetyChecks(name, args) {
       if (
         isSingleSidedSol &&
         args.upside_pct == null &&
-        (!Number.isFinite(requestedBinsAbove) || !Number.isInteger(requestedBinsAbove) || requestedBinsAbove !== 0)
+        (!Number.isFinite(requestedBinsAbove) || !Number.isInteger(requestedBinsAbove) || requestedBinsAbove < 0)
       ) {
         return {
           pass: false,
-          reason: "Single-side SOL deploy must use bins_above=0.",
+          reason: "Single-side SOL deploy bins_above/upperBufferBins must be a non-negative whole-bin integer.",
+        };
+      }
+      if (
+        isSingleSidedSol &&
+        requestedBinsAbove > 0 &&
+        config.strategy.upperBufferDryRunOnly !== false &&
+        process.env.DRY_RUN !== "true"
+      ) {
+        return {
+          pass: false,
+          reason: "upperBufferBins is currently dry-run only. Validate paper results before live use.",
         };
       }
 

@@ -41,3 +41,10 @@ discord-signals.json
 
 # Claude Code runtime lock
 .claude/scheduled_tasks.lock
+
+# Local runtime artifacts
+*.log
+*.pid
+backups/
+meridian.md
+user-config.json.backup*
