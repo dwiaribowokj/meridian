@@ -135,9 +135,12 @@ export const config = {
 
   // ─── Scheduling ─────────────────────────
   schedule: {
-    managementIntervalMin:  u.managementIntervalMin  ?? 10,
-    screeningIntervalMin:   u.screeningIntervalMin   ?? 30,
-    healthCheckIntervalMin: u.healthCheckIntervalMin ?? 60,
+    managementIntervalMin:       u.managementIntervalMin       ?? 10,
+    screeningIntervalMin:        u.screeningIntervalMin        ?? 30,
+    healthCheckIntervalMin:      u.healthCheckIntervalMin      ?? 60,
+    pnlPollIntervalSec:          u.pnlPollIntervalSec          ?? 30,
+    pnlPollTriggerCooldownSec:   u.pnlPollTriggerCooldownSec   ?? Math.max(60, (u.managementIntervalMin ?? 10) * 60),
+    memoryLogIntervalMin:        u.memoryLogIntervalMin        ?? 5,
   },
 
   // ─── LLM Settings ──────────────────────

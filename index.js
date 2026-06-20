@@ -193,6 +193,7 @@ async function maybeRunMissedBriefing() {
 function stopCronJobs() {
   for (const task of _cronTasks) task.stop();
   if (_cronTasks._pnlPollInterval) clearInterval(_cronTasks._pnlPollInterval);
+  if (_cronTasks._memoryLogInterval) clearInterval(_cronTasks._memoryLogInterval);
   _cronTasks = [];
 }
 
@@ -812,7 +813,10 @@ Summarize the current portfolio health, total fees earned, and performance of al
     await maybeRunMissedBriefing();
   }, { timezone: 'UTC' });
 
-  // Lightweight 30s PnL poller — updates trailing TP state between management cycles, no LLM
+  const pnlPollIntervalSec = Math.max(5, Number(config.schedule.pnlPollIntervalSec ?? 30));
+  const pnlPollTriggerCooldownSec = Math.max(5, Number(config.schedule.pnlPollTriggerCooldownSec ?? Math.max(60, config.schedule.managementIntervalMin * 60)));
+
+  // Lightweight PnL poller — updates trailing TP state between management cycles, no LLM
   let _pnlPollBusy = false;
   const pnlPollInterval = setInterval(async () => {
     if (_managementBusy || _screeningBusy || _pnlPollBusy) return;
@@ -837,7 +841,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
             }
             continue;
           }
-          const cooldownMs = config.schedule.managementIntervalMin * 60 * 1000;
+          const cooldownMs = pnlPollTriggerCooldownSec * 1000;
           const sinceLastTrigger = Date.now() - _pollTriggeredAt;
           if (sinceLastTrigger >= cooldownMs) {
             _pollTriggeredAt = Date.now();
@@ -850,7 +854,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
         }
         const closeRule = getDeterministicCloseRule(p, config.management);
         if (closeRule) {
-          const cooldownMs = config.schedule.managementIntervalMin * 60 * 1000;
+          const cooldownMs = pnlPollTriggerCooldownSec * 1000;
           const sinceLastTrigger = Date.now() - _pollTriggeredAt;
           if (sinceLastTrigger >= cooldownMs) {
             _pollTriggeredAt = Date.now();
@@ -865,12 +869,21 @@ Summarize the current portfolio health, total fees earned, and performance of al
     } finally {
       _pnlPollBusy = false;
     }
-  }, 30_000);
+  }, pnlPollIntervalSec * 1000);
 
   _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog];
-  // Store interval ref so stopCronJobs can clear it
+  // Store interval refs so stopCronJobs can clear them
   _cronTasks._pnlPollInterval = pnlPollInterval;
-  log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
+
+  const memoryLogIntervalMin = Math.max(1, Number(config.schedule.memoryLogIntervalMin ?? 5));
+  const memoryLogInterval = setInterval(() => {
+    const usage = process.memoryUsage();
+    const mb = (n) => Math.round(n / 1024 / 1024);
+    log("health", `[MEMORY] rss=${mb(usage.rss)}MB heapUsed=${mb(usage.heapUsed)}MB heapTotal=${mb(usage.heapTotal)}MB external=${mb(usage.external)}MB`);
+  }, memoryLogIntervalMin * 60 * 1000);
+  _cronTasks._memoryLogInterval = memoryLogInterval;
+
+  log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m, pnl poll every ${pnlPollIntervalSec}s, pnl trigger cooldown ${pnlPollTriggerCooldownSec}s`);
 }
 
 // ═══════════════════════════════════════════
