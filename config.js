@@ -33,6 +33,8 @@ const strategyDefaultBinsBelow = Math.max(
 
 // Apply wallet/RPC from user-config if not already in env
 if (u.rpcUrl)    process.env.RPC_URL            ||= u.rpcUrl;
+if (u.heliusBaseUrl) process.env.HELIUS_BASE_URL ||= u.heliusBaseUrl;
+if (u.heliusApiKey) process.env.HELIUS_API_KEY ||= u.heliusApiKey;
 if (u.walletKey) process.env.WALLET_PRIVATE_KEY ||= u.walletKey;
 if (u.llmModel)  process.env.LLM_MODEL          ||= u.llmModel;
 if (u.llmBaseUrl) process.env.LLM_BASE_URL      ||= u.llmBaseUrl;
@@ -165,6 +167,11 @@ export const config = {
     SOL:  "So11111111111111111111111111111111111111112",
     USDC: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
     USDT: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+  },
+
+  helius: {
+    baseUrl: nonEmptyString(u.heliusBaseUrl, process.env.HELIUS_BASE_URL, "https://api.helius.xyz"),
+    apiKey: nonEmptyString(u.heliusApiKey, process.env.HELIUS_API_KEY, ""),
   },
 
   // ─── HiveMind ─────────────────────────
