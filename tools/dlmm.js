@@ -30,6 +30,7 @@ import { normalizeMint } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
+import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -467,6 +468,11 @@ export async function deployPosition({
   fee_tvl_ratio,
   organic_score,
   initial_value_usd,
+  // entry market conditions (injected by executor safety checks)
+  entry_mcap,
+  entry_tvl,
+  entry_volume,
+  entry_holders,
 }) {
   pool_address = normalizeMint(pool_address);
   const activeStrategy = strategy || config.strategy.strategy;
@@ -745,6 +751,10 @@ export async function deployPosition({
           active_bin: activeBin.binId,
           initial_value_usd,
           signal_snapshot: signalSnapshot,
+          entry_mcap,
+          entry_tvl,
+          entry_volume,
+          entry_holders,
         });
       }
 
@@ -883,6 +893,10 @@ export async function deployPosition({
       active_bin: activeBin.binId,
       initial_value_usd,
       signal_snapshot: signalSnapshot,
+      entry_mcap,
+      entry_tvl,
+      entry_volume,
+      entry_holders,
     });
 
     appendDecision({
@@ -971,39 +985,13 @@ async function fetchLpAgentOpenPositions(walletAddress) {
   }
 }
 
-// ─── Fetch DLMM PnL API for all positions in a pool ────────────
-async function fetchDlmmPnlForPool(poolAddress, walletAddress) {
-  const url = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${walletAddress}&status=open&pageSize=100&page=1`;
-  try {
-    const res = await fetch(url);
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      log("pnl_api", `HTTP ${res.status} for pool ${poolAddress.slice(0, 8)}: ${body.slice(0, 120)}`);
-      return {};
-    }
-    const data = await res.json();
-    const positions = data.positions || data.data || [];
-    if (positions.length === 0) {
-      log("pnl_api", `No positions returned for pool ${poolAddress.slice(0, 8)} — keys: ${Object.keys(data).join(", ")}`);
-    }
-    const byAddress = {};
-    for (const p of positions) {
-      const addr = p.positionAddress || p.address || p.position;
-      if (addr) byAddress[addr] = p;
-    }
-    return byAddress;
-  } catch (e) {
-    log("pnl_api", `Fetch error for pool ${poolAddress.slice(0, 8)}: ${e.message}`);
-    return {};
-  }
-}
-
 // ─── Get Position PnL (Meteora API) ─────────────────────────────
 export async function getPositionPnl({ pool_address, position_address }) {
   pool_address = normalizeMint(pool_address);
   position_address = normalizeMint(position_address);
   const walletAddress = getWallet().publicKey.toString();
-  if (shouldUseLpAgentRelay()) {
+  // Prefer the public-infra path (RPC + Jupiter + Meteora deposits) used by getMyPositions.
+  if (config.pnl.source === "rpc") {
     try {
       const payload = await getMyPositions({ force: true, silent: true });
       const p = payload?.positions?.find((position) => position.position === position_address);
@@ -1020,12 +1008,10 @@ export async function getPositionPnl({ pool_address, position_address }) {
           upper_bin: p.upper_bin,
           active_bin: p.active_bin,
           age_minutes: p.age_minutes,
-          request_id: payload?.request_id || null,
         };
       }
-      log("pnl_warn", "Relay positions API did not include requested position; falling back to Meteora PnL path");
     } catch (error) {
-      log("pnl_warn", `Relay PnL lookup failed; falling back to Meteora PnL path: ${error.message}`);
+      log("pnl_warn", `RPC PnL lookup failed; falling back to direct Meteora PnL path: ${error.message}`);
     }
   }
   try {
@@ -1216,24 +1202,25 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
   }
 
   const loadPositions = async () => { try {
-    let relayLpAgentByPosition = null;
-    let relayRequestId = null;
-    if (shouldUseLpAgentRelay()) {
+    // ── Primary path: public infra (on-chain RPC + Jupiter + Meteora deposits) ──
+    // No LPAgent / agentmeridian dependency, so the poller runs aggressively on
+    // fully public resources. Falls through to the Meteora-API path on any error.
+    if (config.pnl.source === "rpc") {
       try {
-        if (!silent) log("positions", "Fetching raw LPAgent open positions via Agent Meridian relay...");
-        const result = await fetchRawOpenPositionsFromMeridian({
-          walletAddress,
-          agentId: getAgentIdForRequests(),
-        });
-        relayLpAgentByPosition = result.byPosition || {};
-        relayRequestId = result.requestId || result.request_id || null;
+        if (!silent) log("positions", `Computing PnL from RPC (${config.pnl.rpcUrl})...`);
+        const rpcResult = await computePositions(walletAddress);
+        if (useLocalWallet) {
+          syncOpenPositions(rpcResult.positions.map((p) => p.position));
+          _positionsCache = rpcResult;
+          _positionsCacheAt = Date.now();
+        }
+        return rpcResult;
       } catch (error) {
-        log("positions_warn", `Agent Meridian raw relay failed; falling back to direct LPAgent fetch: ${error.message}`);
+        log("positions_warn", `RPC PnL path failed; falling back to Meteora portfolio API: ${error.message}`);
       }
     }
 
-    // Portfolio API discovers open pools/positions for this wallet.
-    // Detailed range data stays on Meteora PnL API; value/PnL can be overridden by LPAgent below.
+    // ── Fallback path: Meteora portfolio + /pnl APIs (no LPAgent) ──
     if (!silent) log("positions", "Fetching portfolio via Meteora portfolio API...");
     const portfolioUrl = `https://dlmm.datapi.meteora.ag/portfolio/open?user=${walletAddress}`;
     const res = await fetch(portfolioUrl);
@@ -1248,7 +1235,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
     const binDataByPool = {};
     const pnlMaps = await Promise.all(pools.map(pool => fetchDlmmPnlForPool(pool.poolAddress, walletAddress)));
     pools.forEach((pool, i) => { binDataByPool[pool.poolAddress] = pnlMaps[i]; });
-    const lpAgentByPosition = relayLpAgentByPosition || await fetchLpAgentOpenPositions(walletAddress);
+    const lpAgentByPosition = {}; // LPAgent removed — Meteora binData only
 
     const positions = [];
     for (const pool of pools) {
@@ -1285,9 +1272,16 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
         const pnlPctDiff = reportedPnlPct != null && derivedPnlPct != null
           ? Math.abs(reportedPnlPct - derivedPnlPct)
           : null;
-        const pnlPctSuspicious = pnlPctDiff != null && pnlPctDiff > (config.management.pnlSanityMaxDiffPct ?? 5);
+        // Gate PnL rules ONLY when the tick is genuinely unpriceable (no real number
+        // from either method — e.g. missing deposits / data outage). Reported-vs-derived
+        // divergence is normal noise on volatile pools, so it is logged but NOT gated —
+        // gating on it froze all exits (stop-loss/trailing/close) and stranded positions.
+        const pnlPctSuspicious = reportedPnlPct == null && derivedPnlPct == null;
         if (pnlPctSuspicious) {
-          log("positions_warn", `Suspicious pnl_pct for ${positionAddress.slice(0, 8)}: reported=${reportedPnlPct.toFixed(2)} derived=${derivedPnlPct.toFixed(2)} diff=${pnlPctDiff.toFixed(2)}`);
+          log("positions_warn", `Unpriceable pnl_pct for ${positionAddress.slice(0, 8)}: no valid reported/derived value this tick — PnL rules paused`);
+        } else if (pnlPctDiff != null && pnlPctDiff > (config.management.pnlSanityMaxDiffPct ?? 5)) {
+          // Informational only — does not gate rules.
+          log("positions_warn", `pnl_pct divergence for ${positionAddress.slice(0, 8)}: reported=${reportedPnlPct.toFixed(2)} derived=${derivedPnlPct.toFixed(2)} diff=${pnlPctDiff.toFixed(2)} (informational)`);
         }
 
         positions.push({
@@ -1384,7 +1378,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
       wallet: walletAddress,
       total_positions: positions.length,
       positions,
-      request_id: relayRequestId,
+      source: "meteora",
     };
     if (useLocalWallet) {
       syncOpenPositions(positions.map(p => p.position));
@@ -1703,6 +1697,20 @@ export async function closePosition({ position_address, reason }) {
           tracked,
         });
 
+        let exitMarket = {};
+        try {
+          const { default: fetch } = await import("node-fetch").catch(() => ({ default: globalThis.fetch }));
+          const exitDetail = await fetch(`https://pool-discovery-api.datapi.meteora.ag/pools?page_size=1&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}&timeframe=${encodeURIComponent(config.screening?.timeframe || "5m")}`).then(r => r.json()).catch(() => null);
+          const ep = exitDetail?.data?.[0];
+          if (ep) {
+            exitMarket = {
+              exit_mcap: parseFloat(ep?.token_x?.market_cap) || null,
+              exit_tvl: parseFloat(ep?.tvl ?? ep?.active_tvl) || null,
+              exit_volume: parseFloat(ep?.volume) || null,
+            };
+          }
+        } catch { /* non-blocking */ }
+
         await recordPerformance({
           position: position_address,
           pool: poolAddress,
@@ -1722,6 +1730,11 @@ export async function closePosition({ position_address, reason }) {
           minutes_held: minutesHeld,
           close_reason: reason || "agent decision",
           signal_snapshot: signalSnapshot,
+          entry_mcap: tracked.entry_mcap ?? null,
+          entry_tvl: tracked.entry_tvl ?? null,
+          entry_volume: tracked.entry_volume ?? null,
+          entry_holders: tracked.entry_holders ?? null,
+          ...exitMarket,
         });
 
         appendDecision({
@@ -1990,6 +2003,19 @@ export async function closePosition({ position_address, reason }) {
         tracked,
       });
 
+      let exitMarket = {};
+      try {
+        const exitDetail = await fetch(`https://pool-discovery-api.datapi.meteora.ag/pools?page_size=1&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}&timeframe=${encodeURIComponent(config.screening?.timeframe || "5m")}`).then(r => r.json()).catch(() => null);
+        const ep = exitDetail?.data?.[0];
+        if (ep) {
+          exitMarket = {
+            exit_mcap: parseFloat(ep?.token_x?.market_cap) || null,
+            exit_tvl: parseFloat(ep?.tvl ?? ep?.active_tvl) || null,
+            exit_volume: parseFloat(ep?.volume) || null,
+          };
+        }
+      } catch { /* non-blocking */ }
+
       await recordPerformance({
         position: position_address,
         pool: poolAddress,
@@ -2009,6 +2035,11 @@ export async function closePosition({ position_address, reason }) {
         minutes_held: minutesHeld,
         close_reason: reason || "agent decision",
         signal_snapshot: signalSnapshot,
+        entry_mcap: tracked.entry_mcap ?? null,
+        entry_tvl: tracked.entry_tvl ?? null,
+        entry_volume: tracked.entry_volume ?? null,
+        entry_holders: tracked.entry_holders ?? null,
+        ...exitMarket,
       });
 
       appendDecision({
