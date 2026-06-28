@@ -242,6 +242,47 @@ export function isBaseMintOnCooldown(baseMint) {
   );
 }
 
+export function setManualTokenCooldown({ pool_address, base_mint, name, hours, reason = "manual cooldown" } = {}) {
+  const cooldownHours = Math.max(0, Number(hours ?? config.management.repeatDeployCooldownHours ?? 12));
+  if (!base_mint && !pool_address) return { success: false, error: "base_mint or pool_address required" };
+
+  const db = load();
+  if (pool_address && !db[pool_address]) {
+    db[pool_address] = {
+      name: name || pool_address.slice(0, 8),
+      base_mint: base_mint || null,
+      deploys: [],
+      total_deploys: 0,
+      avg_pnl_pct: 0,
+      win_rate: 0,
+      adjusted_win_rate: 0,
+      adjusted_win_rate_sample_count: 0,
+      last_deployed_at: null,
+      last_outcome: null,
+      notes: [],
+    };
+  }
+  if (pool_address && base_mint && !db[pool_address].base_mint) db[pool_address].base_mint = base_mint;
+
+  const cooldownUntil = new Date(Date.now() + cooldownHours * 60 * 60 * 1000).toISOString();
+  let updated = 0;
+  for (const entry of Object.values(db)) {
+    if ((base_mint && entry?.base_mint === base_mint) || (!base_mint && pool_address && entry === db[pool_address])) {
+      entry.base_mint_cooldown_until = cooldownUntil;
+      entry.base_mint_cooldown_reason = reason;
+      updated += 1;
+    }
+  }
+  if (pool_address && db[pool_address]) {
+    db[pool_address].cooldown_until = cooldownUntil;
+    db[pool_address].cooldown_reason = reason;
+    updated += 1;
+  }
+  save(db);
+  log("pool-memory", `Manual token cooldown set for ${base_mint || pool_address} until ${cooldownUntil} (${reason})`);
+  return { success: true, pool_address, base_mint, cooldown_until: cooldownUntil, hours: cooldownHours, updated };
+}
+
 // ─── Read ──────────────────────────────────────────────────────
 
 /**

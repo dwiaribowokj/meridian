@@ -5,9 +5,9 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
-import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
+import { getMyPositions, closePosition, getActiveBin, searchPools } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
-import { getTopCandidates, degenScore } from "./tools/screening.js";
+import { getTopCandidates, getPoolDetail, degenScore } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
@@ -27,7 +27,7 @@ import {
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, confirmPeak, registerExitSignal } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
-import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
+import { recordPositionSnapshot, recallForPool, addPoolNote, setManualTokenCooldown } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { stageSignals } from "./signal-tracker.js";
@@ -1274,6 +1274,7 @@ function formatHelpText() {
     "/positions — list open positions",
     "/pool <n> — detailed info for one open position",
     "/close <n> — close one position by index",
+    "/closecooldown <n> — close one position and cooldown its token",
     "/closeall — close all open positions",
     "/set <n> <note> — set note/instruction on position",
     "/config — show important runtime config",
@@ -1282,6 +1283,7 @@ function formatHelpText() {
     "/screen — refresh deterministic candidate list",
     "/candidates — show latest cached candidates",
     "/deploy <n> — deploy candidate by cached index",
+    "/deploy <token_address> — find best pool for token and deploy",
     "/briefing — morning briefing",
     "/hive — HiveMind sync status",
     "/hive pull — manual HiveMind pull now",
@@ -1363,6 +1365,50 @@ async function deployLatestCandidate(index) {
     throw new Error(result.error || "Deploy failed");
   }
   return { result, candidate, deployAmount, binsBelow };
+}
+
+async function deployTokenAddress(tokenAddress) {
+  const found = await searchPools({ query: tokenAddress, limit: 10 });
+  const mint = String(tokenAddress || "").trim();
+  const rawPools = (found?.pools || []).filter((p) =>
+    p?.token_x?.mint === mint || p?.token_y?.mint === mint
+  );
+  if (!rawPools.length) {
+    throw new Error(`No DLMM pools found for token ${mint}`);
+  }
+
+  const detailed = [];
+  const filtered = [];
+  for (const raw of rawPools) {
+    try {
+      const detail = await getPoolDetail({ pool_address: raw.pool, timeframe: config.screening.timeframe });
+      const baseMint = detail?.base?.mint || detail?.base_mint || detail?.token_x?.address || raw.token_x?.mint || null;
+      if (baseMint !== mint) {
+        filtered.push(`${raw.name || raw.pool}: token is not base/token_x for this pool`);
+        continue;
+      }
+      const tvl = Number(detail.tvl ?? detail.active_tvl ?? raw.tvl ?? 0);
+      const minTvl = Number(config.screening.minTvl ?? 0);
+      const maxTvl = config.screening.maxTvl == null ? null : Number(config.screening.maxTvl);
+      const feeActiveTvlRatio = Number(detail.fee_active_tvl_ratio ?? detail.fee_tvl_ratio ?? 0);
+      const minFeeActiveTvlRatio = Number(config.screening.minFeeActiveTvlRatio ?? 0);
+      const volatility = Number(detail.volatility ?? 0);
+      if (Number.isFinite(minTvl) && minTvl > 0 && tvl < minTvl) { filtered.push(`${detail.name || raw.name}: TVL below min`); continue; }
+      if (Number.isFinite(maxTvl) && maxTvl > 0 && tvl > maxTvl) { filtered.push(`${detail.name || raw.name}: TVL above max`); continue; }
+      if (Number.isFinite(minFeeActiveTvlRatio) && minFeeActiveTvlRatio > 0 && (!Number.isFinite(feeActiveTvlRatio) || feeActiveTvlRatio < minFeeActiveTvlRatio)) { filtered.push(`${detail.name || raw.name}: fee/active-TVL below min`); continue; }
+      if (!Number.isFinite(volatility) || volatility <= 0) { filtered.push(`${detail.name || raw.name}: volatility unusable`); continue; }
+      detailed.push(detail);
+    } catch (e) {
+      filtered.push(`${raw.name || raw.pool}: ${e.message}`);
+    }
+  }
+  if (!detailed.length) {
+    throw new Error(`No eligible pool for token ${mint}. ${filtered.slice(0, 3).join('; ')}`);
+  }
+  detailed.sort((a, b) => degenScore(b, config.opportunity) - degenScore(a, config.opportunity));
+  const candidate = detailed[0];
+  setLatestCandidates([candidate]);
+  return deployLatestCandidate(0);
 }
 
 function appendHistory(userMsg, assistantMsg) {
@@ -1484,6 +1530,37 @@ async function telegramHandler(msg) {
     return;
   }
 
+  const closeCooldownMatch = text.match(/^\/closecooldown\s+(\d+)$/i);
+  if (closeCooldownMatch) {
+    try {
+      const idx = parseInt(closeCooldownMatch[1]) - 1;
+      const { positions } = await getMyPositions({ force: true });
+      if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
+      const pos = positions[idx];
+      await sendMessage(`Closing ${pos.pair} and setting token cooldown...`);
+      const result = await closePosition({ position_address: pos.position });
+      if (result.success) {
+        const cooldown = setManualTokenCooldown({
+          pool_address: pos.pool,
+          base_mint: pos.base_mint || result.base_mint,
+          name: pos.pair,
+          hours: config.management.repeatDeployCooldownHours,
+          reason: "manual /closecooldown",
+        });
+        const closeTxs = result.close_txs?.length ? result.close_txs : result.txs;
+        await sendMessage([
+          `✅ Closed ${pos.pair}`,
+          `PnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"}`,
+          `Token cooldown until: ${cooldown.cooldown_until || "n/a"}`,
+          `Close txs: ${closeTxs?.join(", ") || "n/a"}`,
+        ].join("\n"));
+      } else {
+        await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
+      }
+    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+    return;
+  }
+
   const closeMatch = text.match(/^\/close\s+(\d+)$/i);
   if (closeMatch) {
     try {
@@ -1570,6 +1647,29 @@ async function telegramHandler(msg) {
 
   if (text === "/candidates") {
     await sendMessage(describeLatestCandidates(5)).catch(() => {});
+    return;
+  }
+
+  const deployAddressMatch = text.match(/^\/deploy\s+([1-9A-HJ-NP-Za-km-z]{32,44})$/i);
+  if (deployAddressMatch) {
+    try {
+      const tokenAddress = deployAddressMatch[1];
+      const { candidate, result, deployAmount, binsBelow } = await deployTokenAddress(tokenAddress);
+      const coverage = result.range_coverage
+        ? `Range: ${fmtPct(result.range_coverage.downside_pct)} downside | ${fmtPct(result.range_coverage.upside_pct)} upside`
+        : `Strategy: ${config.strategy.strategy} | binsBelow: ${binsBelow}`;
+      await sendMessage([
+        `✅ Deployed ${candidate.name}`,
+        `Token: ${tokenAddress}`,
+        `Pool: ${candidate.pool}`,
+        `Amount: ${deployAmount} SOL`,
+        coverage,
+        `Position: ${result.position || "n/a"}`,
+        result.txs?.length ? `Tx: ${result.txs[0]}` : null,
+      ].filter(Boolean).join("\n")).catch(() => {});
+    } catch (e) {
+      await sendMessage(`Error: ${e.message}`).catch(() => {});
+    }
     return;
   }
 
