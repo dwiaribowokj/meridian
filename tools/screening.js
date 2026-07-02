@@ -131,6 +131,37 @@ function getVolatilityTimeframe(sourceTimeframe) {
   return sourceMinutes != null && sourceMinutes >= minMinutes ? source : MIN_VOLATILITY_TIMEFRAME;
 }
 
+
+function getTokenAgeHours(pool) {
+  const createdAt = numeric(pool?.token_x?.created_at);
+  return createdAt == null ? null : (Date.now() - createdAt) / 3_600_000;
+}
+
+function isFreshMomentumEligible(pool, s) {
+  const fm = s.freshMomentum || {};
+  if (!fm.enabled) return false;
+  const ageHours = getTokenAgeHours(pool);
+  if (ageHours == null) return false;
+  if (fm.minAgeHours != null && ageHours < fm.minAgeHours) return false;
+  if (fm.maxAgeHours != null && ageHours > fm.maxAgeHours) return false;
+  const base = pool?.token_x || {};
+  const quote = pool?.token_y || {};
+  const tvl = numeric(pool?.tvl ?? pool?.active_tvl);
+  const volume = numeric(pool?.volume);
+  const holders = numeric(pool?.base_token_holders);
+  const feeActiveTvlRatio = numeric(pool?.fee_active_tvl_ratio);
+  const baseOrganic = numeric(base?.organic_score);
+  const quoteOrganic = numeric(quote?.organic_score);
+  return (
+    tvl != null && tvl >= fm.minTvl &&
+    volume != null && volume >= fm.minVolume &&
+    holders != null && holders >= fm.minHolders &&
+    feeActiveTvlRatio != null && feeActiveTvlRatio >= fm.minFeeActiveTvlRatio &&
+    baseOrganic != null && baseOrganic >= fm.minOrganic &&
+    quoteOrganic != null && quoteOrganic >= fm.minQuoteOrganic
+  );
+}
+
 function getRawPoolScreeningRejectReason(pool, s) {
   const base = pool?.token_x || {};
   const quote = pool?.token_y || {};
@@ -188,7 +219,10 @@ function getRawPoolScreeningRejectReason(pool, s) {
   }
   if (s.minTokenAgeHours != null) {
     const maxCreatedAt = Date.now() - s.minTokenAgeHours * 3_600_000;
-    if (createdAt == null || createdAt > maxCreatedAt) return `token age below minTokenAgeHours ${s.minTokenAgeHours}`;
+    if (createdAt == null || createdAt > maxCreatedAt) {
+      if (!isFreshMomentumEligible(pool, s)) return `token age below minTokenAgeHours ${s.minTokenAgeHours}`;
+      pool.fresh_momentum = true;
+    }
   }
   if (s.maxTokenAgeHours != null) {
     const minCreatedAt = Date.now() - s.maxTokenAgeHours * 3_600_000;
@@ -451,7 +485,7 @@ export async function discoverPools({
     `fee_active_tvl_ratio>=${s.minFeeActiveTvlRatio}`,
     `base_token_organic_score>=${s.minOrganic}`,
     `quote_token_organic_score>=${s.minQuoteOrganic}`,
-    s.minTokenAgeHours != null ? `base_token_created_at<=${Date.now() - s.minTokenAgeHours * 3_600_000}` : null,
+    s.minTokenAgeHours != null && !s.freshMomentum?.enabled ? `base_token_created_at<=${Date.now() - s.minTokenAgeHours * 3_600_000}` : null,
     s.maxTokenAgeHours != null ? `base_token_created_at>=${Date.now() - s.maxTokenAgeHours * 3_600_000}` : null,
     Array.isArray(s.allowedLaunchpads) && s.allowedLaunchpads.length > 0
       ? `base_token_launchpad=[${s.allowedLaunchpads.join(",")}]`
