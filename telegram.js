@@ -400,8 +400,9 @@ async function poll(onMessage) {
         await onMessage(msg);
       }
     } catch (e) {
-      if (!e.message?.includes("aborted")) {
-        log("telegram_error", `Poll error: ${e.message}`);
+      const message = e.message || "";
+      if (!message.includes("aborted") && message !== "fetch failed") {
+        log("telegram_error", `Poll error: ${message}`);
       }
       await sleep(5000);
     }
@@ -415,6 +416,7 @@ const BOT_COMMANDS = [
   { command: "positions",  description: "List open positions" },
   { command: "pool",       description: "Detailed info for one open position" },
   { command: "close",      description: "Close one position by index" },
+  { command: "closecooldown", description: "Close position and cooldown token" },
   { command: "closeall",   description: "Close all open positions" },
   { command: "set",        description: "Set note/instruction on position" },
   { command: "config",     description: "Show important runtime config" },
