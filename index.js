@@ -1367,6 +1367,21 @@ async function deployLatestCandidate(index) {
   return { result, candidate, deployAmount, binsBelow };
 }
 
+
+async function deployPoolAddress(poolAddress) {
+  const candidate = await getPoolDetail({ pool_address: poolAddress, timeframe: config.screening.timeframe });
+  if (!candidate?.pool && !candidate?.pool_address) {
+    throw new Error(`Pool detail not found for ${poolAddress}`);
+  }
+  candidate.pool = candidate.pool || candidate.pool_address || poolAddress;
+  candidate.name = candidate.name || `${poolAddress.slice(0, 8)}...`;
+  candidate.base_mint = candidate.base?.mint || candidate.base_mint || candidate.token_x?.address || null;
+  candidate.base_fee = candidate.base_fee ?? candidate.fee_pct;
+  candidate.fee_tvl_ratio = candidate.fee_active_tvl_ratio ?? candidate.fee_tvl_ratio;
+  setLatestCandidates([candidate]);
+  return deployLatestCandidate(0);
+}
+
 async function deployTokenAddress(tokenAddress) {
   const found = await searchPools({ query: tokenAddress, limit: 10 });
   const mint = String(tokenAddress || "").trim();
@@ -1647,6 +1662,28 @@ async function telegramHandler(msg) {
 
   if (text === "/candidates") {
     await sendMessage(describeLatestCandidates(5)).catch(() => {});
+    return;
+  }
+
+  const deployPoolMatch = text.match(/^\/deploy\s+pool\s+([1-9A-HJ-NP-Za-km-z]{32,44})$/i);
+  if (deployPoolMatch) {
+    try {
+      const poolAddress = deployPoolMatch[1];
+      const { candidate, result, deployAmount, binsBelow } = await deployPoolAddress(poolAddress);
+      const coverage = result.range_coverage
+        ? `Range: ${fmtPct(result.range_coverage.downside_pct)} downside | ${fmtPct(result.range_coverage.upside_pct)} upside`
+        : `Strategy: ${config.strategy.strategy} | binsBelow: ${binsBelow}`;
+      await sendMessage([
+        `✅ Deployed ${candidate.name}`,
+        `Pool: ${candidate.pool}`,
+        `Amount: ${deployAmount} SOL`,
+        coverage,
+        `Position: ${result.position || "n/a"}`,
+        result.txs?.length ? `Tx: ${result.txs[0]}` : null,
+      ].filter(Boolean).join("\n")).catch(() => {});
+    } catch (e) {
+      await sendMessage(`Error: ${e.message}`).catch(() => {});
+    }
     return;
   }
 
