@@ -918,16 +918,6 @@ function getDeterministicCloseRule(position, managementConfig) {
     return { action: "CLOSE", rule: 2, reason: "take profit" };
   }
   if (
-    !pnlSuspect &&
-    position.pnl_pct != null &&
-    managementConfig.protectPeakTriggerPct != null &&
-    managementConfig.protectPeakDropPct != null &&
-    (tracked?.peak_pnl_pct ?? 0) >= managementConfig.protectPeakTriggerPct &&
-    ((tracked?.peak_pnl_pct ?? 0) - position.pnl_pct) >= managementConfig.protectPeakDropPct
-  ) {
-    return { action: "CLOSE", rule: "protect_peak", reason: `protect peak: ${tracked.peak_pnl_pct.toFixed(2)}% → ${position.pnl_pct.toFixed(2)}%` };
-  }
-  if (
     position.active_bin != null &&
     position.upper_bin != null &&
     position.active_bin > position.upper_bin + managementConfig.outOfRangeBinsToClose

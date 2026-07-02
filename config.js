@@ -100,17 +100,6 @@ export const config = {
     blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
-    freshMomentum: {
-      enabled: u.freshMomentumEnabled ?? false,
-      minAgeHours: u.freshMomentumMinAgeHours ?? 1,
-      maxAgeHours: u.freshMomentumMaxAgeHours ?? 12,
-      minTvl: u.freshMomentumMinTvl ?? Math.max(u.minTvl ?? 0, 50000),
-      minVolume: u.freshMomentumMinVolume ?? Math.max(u.minVolume ?? 0, 1000),
-      minOrganic: u.freshMomentumMinOrganic ?? Math.max(u.minOrganic ?? 0, 75),
-      minQuoteOrganic: u.freshMomentumMinQuoteOrganic ?? Math.max(u.minQuoteOrganic ?? 0, 75),
-      minHolders: u.freshMomentumMinHolders ?? Math.max(u.minHolders ?? 0, 1000),
-      minFeeActiveTvlRatio: u.freshMomentumMinFeeActiveTvlRatio ?? Math.max(u.minFeeActiveTvlRatio ?? 0, 0.06),
-    },
   },
 
   // ─── Position Management ────────────────
@@ -142,8 +131,6 @@ export const config = {
     trailingTriggerPct:    u.trailingTriggerPct    ?? 3,    // activate trailing at X% PnL
     trailingDropPct:       u.trailingDropPct       ?? 1.5,  // close when drops X% from peak
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
-    protectPeakTriggerPct: u.protectPeakTriggerPct ?? null, // close if peak reached and current gives back too much
-    protectPeakDropPct:    u.protectPeakDropPct    ?? null,
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
   },
@@ -342,15 +329,6 @@ export function reloadScreeningThresholds() {
     if (fresh.category          != null) s.category          = fresh.category;
     if (fresh.minTokenAgeHours  !== undefined) s.minTokenAgeHours = fresh.minTokenAgeHours;
     if (fresh.maxTokenAgeHours  !== undefined) s.maxTokenAgeHours = fresh.maxTokenAgeHours;
-    if (fresh.freshMomentumEnabled !== undefined) s.freshMomentum.enabled = fresh.freshMomentumEnabled;
-    if (fresh.freshMomentumMinAgeHours !== undefined) s.freshMomentum.minAgeHours = fresh.freshMomentumMinAgeHours;
-    if (fresh.freshMomentumMaxAgeHours !== undefined) s.freshMomentum.maxAgeHours = fresh.freshMomentumMaxAgeHours;
-    if (fresh.freshMomentumMinTvl !== undefined) s.freshMomentum.minTvl = fresh.freshMomentumMinTvl;
-    if (fresh.freshMomentumMinVolume !== undefined) s.freshMomentum.minVolume = fresh.freshMomentumMinVolume;
-    if (fresh.freshMomentumMinOrganic !== undefined) s.freshMomentum.minOrganic = fresh.freshMomentumMinOrganic;
-    if (fresh.freshMomentumMinQuoteOrganic !== undefined) s.freshMomentum.minQuoteOrganic = fresh.freshMomentumMinQuoteOrganic;
-    if (fresh.freshMomentumMinHolders !== undefined) s.freshMomentum.minHolders = fresh.freshMomentumMinHolders;
-    if (fresh.freshMomentumMinFeeActiveTvlRatio !== undefined) s.freshMomentum.minFeeActiveTvlRatio = fresh.freshMomentumMinFeeActiveTvlRatio;
     if (fresh.avoidPvpSymbols   !== undefined) s.avoidPvpSymbols = fresh.avoidPvpSymbols;
     if (fresh.blockPvpSymbols   !== undefined) s.blockPvpSymbols = fresh.blockPvpSymbols;
     if (fresh.maxBotHoldersPct  != null) s.maxBotHoldersPct = fresh.maxBotHoldersPct;
