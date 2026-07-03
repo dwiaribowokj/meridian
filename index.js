@@ -300,7 +300,17 @@ export async function runManagementCycle({ silent = false } = {}) {
       const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
       const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
       const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
-      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
+      const peak = p.peak_pnl_pct ?? 0;
+      const dynEnabled = !!config.management.dynamicStopLossEnabled;
+      const dynTrigger = config.management.breakevenTriggerPct ?? 1;
+      const dynStop = config.management.breakevenStopPct ?? 0.5;
+      const baseStop = config.management.dynamicStopBasePct ?? config.management.stopLossPct;
+      const dynActive = dynEnabled && peak >= dynTrigger && (p.age_minutes == null || p.age_minutes >= (config.management.dynamicStopMinAgeMinutes ?? 10));
+      const effectiveSl = dynActive ? Math.max(Number(baseStop ?? -50), Number(dynStop)) : baseStop;
+      const slInfo = dynEnabled
+        ? `SL: ${Number(effectiveSl).toFixed(2)}% (${dynActive ? `DynSL active; peak ${Number(peak).toFixed(2)}%` : `DynSL armed @ +${Number(dynTrigger).toFixed(2)}% → +${Number(dynStop).toFixed(2)}%`})`
+        : `SL: ${baseStop ?? "?"}%`;
+      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Peak: ${Number(peak).toFixed(2)}% | ${slInfo} | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
       if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
       if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
