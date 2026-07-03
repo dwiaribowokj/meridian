@@ -425,6 +425,7 @@ const BOT_COMMANDS = [
   { command: "pool",       description: "Detailed info for one open position" },
   { command: "close",      description: "Close one position by index" },
   { command: "closecooldown", description: "Close position and cooldown token" },
+  { command: "cooldown",   description: "Cooldown token/pool without closing" },
   { command: "closeall",   description: "Close all open positions" },
   { command: "set",        description: "Set note/instruction on position" },
   { command: "config",     description: "Show important runtime config" },

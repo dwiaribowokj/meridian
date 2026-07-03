@@ -1275,6 +1275,7 @@ function formatHelpText() {
     "/pool <n> — detailed info for one open position",
     "/close <n> — close one position by index",
     "/closecooldown <n> — close one position and cooldown its token",
+    "/cooldown <pool_or_token> — cooldown token/pool without closing",
     "/closeall — close all open positions",
     "/set <n> <note> — set note/instruction on position",
     "/config — show important runtime config",
@@ -1572,6 +1573,66 @@ async function telegramHandler(msg) {
       } else {
         await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
       }
+    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+    return;
+  }
+
+  const cooldownMatch = text.match(/^\/cooldown\s+([1-9A-HJ-NP-Za-km-z]{32,44})$/i);
+  if (cooldownMatch) {
+    try {
+      const address = cooldownMatch[1];
+      let poolAddress = null;
+      let baseMint = null;
+      let name = address.slice(0, 8);
+
+      const tracked = getTrackedPositions().find((p) => p.pool === address || p.signal_snapshot?.base_mint === address);
+      if (tracked) {
+        poolAddress = tracked.pool || null;
+        baseMint = tracked.signal_snapshot?.base_mint || null;
+        name = tracked.pool_name || name;
+      }
+
+      if (!poolAddress) {
+        try {
+          const detail = await getPoolDetail({ pool_address: address, timeframe: config.screening.timeframe });
+          if (detail?.pool || detail?.pool_address) {
+            poolAddress = detail.pool || detail.pool_address || address;
+            baseMint = detail.base?.mint || detail.base_mint || detail.token_x?.address || null;
+            name = detail.name || name;
+          }
+        } catch {}
+      }
+
+      if (!poolAddress && !baseMint) {
+        baseMint = address;
+        try {
+          const found = await searchPools({ query: address, limit: 1 });
+          const first = found?.pools?.[0];
+          if (first) {
+            poolAddress = first.pool || null;
+            name = first.name || name;
+          }
+        } catch {}
+      }
+
+      const cooldown = setManualTokenCooldown({
+        pool_address: poolAddress,
+        base_mint: baseMint,
+        name,
+        hours: config.management.repeatDeployCooldownHours,
+        reason: "manual /cooldown",
+      });
+      if (!cooldown?.success) {
+        await sendMessage(`❌ Cooldown failed: ${cooldown?.error || "unknown error"}`).catch(() => {});
+        return;
+      }
+      await sendMessage([
+        `✅ Cooldown set for ${name}`,
+        poolAddress ? `Pool: ${poolAddress}` : null,
+        baseMint ? `Token: ${baseMint}` : null,
+        `Until: ${cooldown.cooldown_until || "n/a"}`,
+        `Updated entries: ${cooldown.updated ?? "?"}`,
+      ].filter(Boolean).join("\n")).catch(() => {});
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
     return;
   }
