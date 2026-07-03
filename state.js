@@ -536,11 +536,28 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
 
   if (changed) save(state);
 
-  // ── Stop loss ──────────────────────────────────────────────────
-  if (!pnl_pct_suspicious && currentPnlPct != null && mgmtConfig.stopLossPct != null && currentPnlPct <= mgmtConfig.stopLossPct) {
+  const ageMinutes = positionData.age_minutes;
+  let effectiveStopLossPct = mgmtConfig.stopLossPct;
+  let effectiveStopReason = "Stop loss";
+  if (
+    mgmtConfig.dynamicStopLossEnabled &&
+    !pnl_pct_suspicious &&
+    currentPnlPct != null &&
+    (ageMinutes == null || ageMinutes >= (mgmtConfig.dynamicStopMinAgeMinutes ?? 10)) &&
+    (pos.peak_pnl_pct ?? 0) >= (mgmtConfig.breakevenTriggerPct ?? 1)
+  ) {
+    effectiveStopLossPct = Math.max(
+      Number(mgmtConfig.dynamicStopBasePct ?? mgmtConfig.stopLossPct ?? -50),
+      Number(mgmtConfig.breakevenStopPct ?? 0.5),
+    );
+    effectiveStopReason = `Dynamic SL: peak ${(pos.peak_pnl_pct ?? 0).toFixed(2)}% >= ${mgmtConfig.breakevenTriggerPct ?? 1}%`;
+  }
+
+  // ── Stop loss / dynamic stop-loss ──────────────────────────────
+  if (!pnl_pct_suspicious && currentPnlPct != null && effectiveStopLossPct != null && currentPnlPct <= effectiveStopLossPct) {
     return {
       action: "STOP_LOSS",
-      reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= ${mgmtConfig.stopLossPct}%`,
+      reason: `${effectiveStopReason}: PnL ${currentPnlPct.toFixed(2)}% <= ${effectiveStopLossPct}%`,
     };
   }
 

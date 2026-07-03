@@ -238,6 +238,7 @@ export async function runManagementCycle({ silent = false } = {}) {
     if (positions.length === 0) {
       log("cron", "No open positions — triggering screening cycle");
       mgmtReport = "No open positions. Triggering screening cycle.";
+      await liveMessage?.note("No open positions — triggering screening.").catch(() => {});
       runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
       return mgmtReport;
     }
@@ -323,6 +324,7 @@ export async function runManagementCycle({ silent = false } = {}) {
     });
 
     if (actionPositions.length > 0) {
+      await liveMessage?.note(`Executing ${actionPositions.length} management action(s): ${actionSummary}`).catch(() => {});
       const execReport = await executeManagementActions(actionPositions, actionMap, { liveMessage, cur });
       if (execReport) mgmtReport += `\n\n${execReport}`;
     } else {
@@ -374,6 +376,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     if (prePositions.total_positions >= config.risk.maxPositions) {
       log("cron", `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`);
       screenReport = `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions}).`;
+      if (!silent && telegramEnabled()) sendMessage(`🔍 Screening skipped\n${screenReport}`).catch(() => {});
       appendDecision({
         type: "skip",
         actor: "SCREENER",
@@ -388,6 +391,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     if (!isDryRun && preBalance.sol < minRequired) {
       log("cron", `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas)`);
       screenReport = `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas).`;
+      if (!silent && telegramEnabled()) sendMessage(`🔍 Screening skipped\n${screenReport}`).catch(() => {});
       appendDecision({
         type: "skip",
         actor: "SCREENER",
@@ -413,6 +417,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const currentBalance = preBalance;
     const deployAmount = computeDeployAmount(currentBalance.sol);
     log("cron", `Computed deploy amount: ${deployAmount} SOL (wallet: ${currentBalance.sol} SOL)`);
+    await liveMessage?.note(`Wallet ${currentBalance.sol} SOL → deploy amount ${deployAmount} SOL. Fetching candidates...`).catch(() => {});
 
     // Load active strategy
     const activeStrategy = getActiveStrategy();
@@ -424,6 +429,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const topCandidates = await getTopCandidates({ limit: 10 }).catch(() => null);
     const candidates = (topCandidates?.candidates || topCandidates?.pools || []).slice(0, 10);
     const earlyFilteredExamples = topCandidates?.filtered_examples || [];
+    await liveMessage?.note(`Fetched ${candidates.length} top candidate(s); running audits/recon...`).catch(() => {});
 
     const allCandidates = [];
     for (const pool of candidates) {

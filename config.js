@@ -130,6 +130,13 @@ export const config = {
     trailingTakeProfit:    u.trailingTakeProfit    ?? true,
     trailingTriggerPct:    u.trailingTriggerPct    ?? 3,    // activate trailing at X% PnL
     trailingDropPct:       u.trailingDropPct       ?? 1.5,  // close when drops X% from peak
+    // Dynamic stop-loss / profit protection. Keeps the base SL early, then raises the
+    // effective stop once a confirmed peak proves the position has room to lock profit.
+    dynamicStopLossEnabled: u.dynamicStopLossEnabled ?? false,
+    dynamicStopBasePct:     u.dynamicStopBasePct     ?? u.stopLossPct ?? u.emergencyPriceDropPct ?? -50,
+    breakevenTriggerPct:    u.breakevenTriggerPct    ?? 1.0,
+    breakevenStopPct:       u.breakevenStopPct       ?? 0.5,
+    dynamicStopMinAgeMinutes: u.dynamicStopMinAgeMinutes ?? 10,
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
