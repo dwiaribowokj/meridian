@@ -115,7 +115,11 @@ async function postTelegram(method, body) {
     }
     return await res.json();
   } catch (e) {
-    log("telegram_error", `${method} failed: ${e.message}`);
+    const message = e.message || "";
+    const isExpectedFetchNoise = message === "fetch failed" && ["sendMessage", "sendChatAction", "editMessageText"].includes(method);
+    if (!isExpectedFetchNoise) {
+      log("telegram_error", `${method} failed: ${message}`);
+    }
     return null;
   }
 }
@@ -139,7 +143,11 @@ async function postTelegramRaw(method, body) {
     }
     return await res.json();
   } catch (e) {
-    log("telegram_error", `${method} failed: ${e.message}`);
+    const message = e.message || "";
+    const isExpectedFetchNoise = message === "fetch failed" && ["answerCallbackQuery"].includes(method);
+    if (!isExpectedFetchNoise) {
+      log("telegram_error", `${method} failed: ${message}`);
+    }
     return null;
   }
 }
