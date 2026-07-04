@@ -300,7 +300,11 @@ export async function runManagementCycle({ silent = false } = {}) {
       const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
       const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
       const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
-      const peak = p.peak_pnl_pct ?? 0;
+      // getMyPositions() returns live RPC-derived position data and does not carry
+      // confirmed state-only fields such as peak_pnl_pct. Use tracked state first
+      // so the management report/DynSL display matches actual exit logic.
+      const tracked = getTrackedPosition(p.position);
+      const peak = tracked?.peak_pnl_pct ?? p.peak_pnl_pct ?? 0;
       const dynEnabled = !!config.management.dynamicStopLossEnabled;
       const dynTrigger = config.management.breakevenTriggerPct ?? 1;
       const dynStop = config.management.breakevenStopPct ?? 0.5;
@@ -1582,7 +1586,8 @@ async function telegramHandler(msg) {
         const closeTxs = result.close_txs?.length ? result.close_txs : result.txs;
         await sendMessage([
           `✅ Closed ${pos.pair}`,
-          `PnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"}`,
+          `Reason: ${result.close_reason || "manual /closecooldown"}`,
+          `PnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"}${result.pnl_pct != null ? ` (${result.pnl_pct}%)` : ""}`,
           `Token cooldown until: ${cooldown.cooldown_until || "n/a"}`,
           `Close txs: ${closeTxs?.join(", ") || "n/a"}`,
         ].join("\n"));
@@ -1665,7 +1670,7 @@ async function telegramHandler(msg) {
       if (result.success) {
         const closeTxs = result.close_txs?.length ? result.close_txs : result.txs;
         const claimNote = result.claim_txs?.length ? `\nClaim txs: ${result.claim_txs.join(", ")}` : "";
-        await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
+        await sendMessage(`✅ Closed ${pos.pair}\nReason: ${result.close_reason || "manual /close"}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"}${result.pnl_pct != null ? ` (${result.pnl_pct}%)` : ""} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
       } else {
         await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
       }

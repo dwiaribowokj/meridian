@@ -2072,6 +2072,7 @@ export async function closePosition({ position_address, reason }) {
         txs: txHashes,
         pnl_usd: pnlUsd,
         pnl_pct: pnlPct,
+        close_reason: reason || "agent decision",
         base_mint: closeBaseMint,
       };
     }
@@ -2095,6 +2096,7 @@ export async function closePosition({ position_address, reason }) {
       claim_txs: claimTxHashes,
       close_txs: closeTxHashes,
       txs: txHashes,
+      close_reason: reason || "agent decision",
       base_mint: pool.lbPair.tokenXMint.toString(),
     };
   } catch (error) {
