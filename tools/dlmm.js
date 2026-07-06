@@ -108,6 +108,109 @@ function shouldUseLpAgentRelayForDeploy() {
   return false;
 }
 
+function roundSolAmount(value) {
+  return Number(Number(value).toFixed(9));
+}
+
+function publicLayer(layer) {
+  return {
+    strategy: layer.strategy,
+    pct: layer.pct,
+    amount_x: layer.amount_x,
+    amount_y: layer.amount_y,
+  };
+}
+
+function singleLayerPlan(activeStrategy, finalAmountX, finalAmountY, strategyMap, fallbackReason = null) {
+  return {
+    multiLayer: false,
+    effectiveStrategy: activeStrategy,
+    fallbackReason,
+    layers: [{
+      strategy: activeStrategy,
+      strategyType: strategyMap[activeStrategy],
+      pct: 100,
+      amount_x: finalAmountX,
+      amount_y: finalAmountY,
+    }],
+  };
+}
+
+export function buildLayerPlan({
+  activeStrategy,
+  finalAmountX,
+  finalAmountY,
+  strategyMap,
+  strategyConfig = config.strategy,
+  allowMultiLayer = true,
+}) {
+  const single = (reason = null) => singleLayerPlan(activeStrategy, finalAmountX, finalAmountY, strategyMap, reason);
+  if (!allowMultiLayer) return single();
+  if (!strategyConfig.multiLayerEnabled) return single();
+  if (finalAmountX > 0) return single("multi-layer disabled for token-side deposits");
+  if (strategyConfig.multiLayerMode !== "same_position") return single(`unsupported multiLayerMode ${strategyConfig.multiLayerMode}`);
+
+  const configuredLayers = Array.isArray(strategyConfig.multiLayerLayers) && strategyConfig.multiLayerLayers.length > 0
+    ? strategyConfig.multiLayerLayers
+    : [
+        { strategy: strategyConfig.multiLayerPrimaryStrategy ?? "bid_ask", pct: strategyConfig.multiLayerPrimaryPct ?? 70 },
+        { strategy: strategyConfig.multiLayerSecondaryStrategy ?? "spot", pct: strategyConfig.multiLayerSecondaryPct ?? 30 },
+      ];
+  const layers = configuredLayers.map((layer) => ({
+    strategy: String(layer?.strategy || "").trim(),
+    pct: Number(layer?.pct),
+  }));
+  if (layers.length < 2) return single("multi-layer requires at least 2 layers");
+  const badLayer = layers.find((layer) =>
+    !layer.strategy ||
+    !Number.isFinite(layer.pct) ||
+    layer.pct <= 0 ||
+    (strategyMap[layer.strategy] == null)
+  );
+  if (badLayer) {
+    return single(`invalid multi-layer layer ${JSON.stringify({ strategy: badLayer.strategy, pct: badLayer.pct })}`);
+  }
+  const totalPct = layers.reduce((sum, layer) => sum + layer.pct, 0);
+  if (Math.abs(totalPct - 100) > 0.0001) return single(`multi-layer split must total 100, got ${totalPct}`);
+
+  const minLayerSol = Math.max(0, Number(strategyConfig.multiLayerMinLayerSol ?? strategyConfig.multiLayerMinSecondarySol ?? 0.05));
+  let remainingY = finalAmountY;
+  const plannedLayers = layers.map((layer, index) => {
+    const isLast = index === layers.length - 1;
+    const amountY = isLast ? roundSolAmount(remainingY) : roundSolAmount(finalAmountY * (layer.pct / 100));
+    remainingY = roundSolAmount(remainingY - amountY);
+    return {
+      strategy: layer.strategy,
+      strategyType: strategyMap[layer.strategy],
+      pct: layer.pct,
+      amount_x: 0,
+      amount_y: amountY,
+    };
+  });
+  const tooSmallLayer = plannedLayers.find((layer, index) => index > 0 && layer.amount_y < minLayerSol);
+  if (tooSmallLayer) return single(`layer ${tooSmallLayer.strategy} ${tooSmallLayer.amount_y} SOL below minimum ${minLayerSol} SOL`);
+  if (plannedLayers[0].amount_y <= 0) return single("primary layer amount is zero");
+
+  return {
+    multiLayer: true,
+    effectiveStrategy: "multi_layer",
+    fallbackReason: null,
+    layers: plannedLayers,
+  };
+}
+
+function buildLayerExecutionPlan(layers, totalYLamports) {
+  let allocatedY = new BN(0);
+  return layers.map((layer, index) => {
+    const isLast = index === layers.length - 1;
+    const totalYAmount = isLast
+      ? totalYLamports.sub(allocatedY)
+      : new BN(Math.floor(layer.amount_y * 1e9));
+    allocatedY = allocatedY.add(totalYAmount);
+    return { ...layer, totalXAmount: new BN(0), totalYAmount };
+  });
+}
+
 function signSerializedTransaction(serialized, wallet) {
   const bytes = Buffer.from(serialized, "base64");
   try {
@@ -475,7 +578,8 @@ export async function deployPosition({
   entry_holders,
 }) {
   pool_address = normalizeMint(pool_address);
-  const activeStrategy = strategy || config.strategy.strategy;
+  const strategyWasExplicit = strategy != null && String(strategy).trim() !== "";
+  const activeStrategy = strategyWasExplicit ? String(strategy).trim() : config.strategy.strategy;
   let activeBinsBelow = bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow;
   let activeBinsAbove = bins_above ?? 0;
   const parsedVolatility = volatility == null ? null : Number(volatility);
@@ -613,15 +717,28 @@ export async function deployPosition({
   const downsideCoveragePct = activePrice > 0 ? ((activePrice - minPrice) / activePrice) * 100 : null;
   const upsideCoveragePct = activePrice > 0 ? ((maxPrice - activePrice) / activePrice) * 100 : null;
   const totalWidthPct = minPrice > 0 ? ((maxPrice - minPrice) / minPrice) * 100 : null;
+  const layerPlan = buildLayerPlan({
+    activeStrategy,
+    finalAmountX,
+    finalAmountY,
+    strategyMap,
+    allowMultiLayer: !strategyWasExplicit,
+  });
+  const effectiveStrategy = layerPlan.effectiveStrategy;
+  const layerMetadata = layerPlan.layers.map(publicLayer);
+  if (layerPlan.fallbackReason) {
+    log("deploy", `Multi-layer fallback: ${layerPlan.fallbackReason}`);
+  }
 
   if (process.env.DRY_RUN === "true") {
     const paperPosition = trackPaperPosition({
       pool: pool_address,
       pool_name,
-      strategy: activeStrategy,
+      strategy: effectiveStrategy,
       bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
       amount_sol: finalAmountY,
       amount_x: finalAmountX,
+      layers: layerMetadata,
       active_bin: activeBin.binId,
       bin_step: actualBinStep,
       volatility: normalizedVolatility,
@@ -640,7 +757,9 @@ export async function deployPosition({
       paper_position: paperPosition,
       would_deploy: {
         pool_address,
-        strategy: activeStrategy,
+        strategy: effectiveStrategy,
+        layers: layerMetadata,
+        multi_layer_fallback_reason: layerPlan.fallbackReason,
         bins_below: activeBinsBelow,
         bins_above: activeBinsAbove,
         bin_range: { min: minBinId, max: maxBinId },
@@ -671,7 +790,12 @@ export async function deployPosition({
     totalXLamports = new BN(Math.floor(finalAmountX * Math.pow(10, decimals)));
   }
 
-  if (shouldUseLpAgentRelayForDeploy()) {
+  const useRelayDeploy = shouldUseLpAgentRelayForDeploy() && !layerPlan.multiLayer;
+  if (shouldUseLpAgentRelayForDeploy() && layerPlan.multiLayer) {
+    log("deploy", "Relay deploy skipped for multi-layer position; using local SDK path");
+  }
+
+  if (useRelayDeploy) {
     try {
       const wallet = getWallet();
       log(
@@ -814,12 +938,67 @@ export async function deployPosition({
   const newPosition = Keypair.generate();
 
   log("deploy", `Pool: ${pool_address}`);
-  log("deploy", `Strategy: ${activeStrategy}, Bins: ${minBinId} to ${maxBinId} (${totalBins} bins${isWideRange ? " — WIDE RANGE" : ""})`);
+  const layerSummary = layerMetadata.map((layer) => `${layer.strategy} ${layer.pct}%`).join(" + ");
+  log("deploy", `Strategy: ${effectiveStrategy}${layerPlan.multiLayer ? ` (${layerSummary})` : ""}, Bins: ${minBinId} to ${maxBinId} (${totalBins} bins${isWideRange ? " — WIDE RANGE" : ""})`);
   log("deploy", `Amount: ${finalAmountX} X, ${finalAmountY} Y`);
+  if (layerPlan.multiLayer) {
+    for (const layer of layerMetadata) {
+      log("deploy", `Layer: ${layer.strategy} ${layer.pct}% — ${layer.amount_y} Y`);
+    }
+  }
   log("deploy", `Position: ${newPosition.publicKey.toString()}`);
 
   try {
     const txHashes = [];
+    const executedLayers = [];
+    const initialNotes = [];
+    const executionLayers = buildLayerExecutionPlan(layerPlan.layers, totalYLamports);
+
+    const executedLayerMetadata = (layer) => ({
+      strategy: layer.strategy,
+      pct: layer.pct,
+      amount_x: 0,
+      amount_y: roundSolAmount(Number(layer.totalYAmount.toString()) / 1e9),
+    });
+
+    const addExecutedLayer = (layer) => {
+      executedLayers.push(executedLayerMetadata(layer));
+    };
+
+    const addLiquidityLayer = async (layer, index) => {
+      const addTxs = await pool.addLiquidityByStrategyChunkable({
+        positionPubKey: newPosition.publicKey,
+        user: wallet.publicKey,
+        totalXAmount: layer.totalXAmount,
+        totalYAmount: layer.totalYAmount,
+        strategy: { minBinId, maxBinId, strategyType: layer.strategyType },
+        slippage: 10, // 10%
+      });
+      const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
+      for (let i = 0; i < addTxArray.length; i++) {
+        const txHash = await sendAndConfirmTransaction(getConnection(), addTxArray[i], [wallet]);
+        txHashes.push(txHash);
+        log("deploy", `Add ${layer.strategy} layer tx ${i + 1}/${addTxArray.length}: ${txHash}`);
+      }
+      addExecutedLayer(layer);
+      log("deploy", `Layer ${index + 1}/${executionLayers.length} added: ${layer.strategy}`);
+    };
+
+    const addRemainingLayers = async (startIndex) => {
+      for (let i = startIndex; i < executionLayers.length; i++) {
+        try {
+          await addLiquidityLayer(executionLayers[i], i);
+        } catch (error) {
+          if (i > 0 && executedLayers.length > 0) {
+            const note = `secondary_layer_failed: ${executionLayers[i].strategy}: ${error.message}`;
+            initialNotes.push(note);
+            log("deploy_warn", note);
+            break;
+          }
+          throw error;
+        }
+      }
+    };
 
     if (isWideRange) {
       // ── Wide Range Path (>69 bins) ─────────────────────────────────
@@ -843,33 +1022,23 @@ export async function deployPosition({
         log("deploy", `Create tx ${i + 1}/${createTxArray.length}: ${txHash}`);
       }
 
-      // Phase 2: Add liquidity (may be multiple txs)
-      const addTxs = await pool.addLiquidityByStrategyChunkable({
-        positionPubKey: newPosition.publicKey,
-        user: wallet.publicKey,
-        totalXAmount: totalXLamports,
-        totalYAmount: totalYLamports,
-        strategy: { minBinId, maxBinId, strategyType },
-        slippage: 10, // 10%
-      });
-      const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
-      for (let i = 0; i < addTxArray.length; i++) {
-        const txHash = await sendAndConfirmTransaction(getConnection(), addTxArray[i], [wallet]);
-        txHashes.push(txHash);
-        log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
-      }
+      // Phase 2: Add each configured layer to the same position.
+      await addRemainingLayers(0);
     } else {
       // ── Standard Path (≤69 bins) ─────────────────────────────────
+      const firstLayer = executionLayers[0];
       const tx = await pool.initializePositionAndAddLiquidityByStrategy({
         positionPubKey: newPosition.publicKey,
         user: wallet.publicKey,
-        totalXAmount: totalXLamports,
-        totalYAmount: totalYLamports,
-        strategy: { maxBinId, minBinId, strategyType },
+        totalXAmount: firstLayer.totalXAmount,
+        totalYAmount: firstLayer.totalYAmount,
+        strategy: { maxBinId, minBinId, strategyType: firstLayer.strategyType },
         slippage: 1000, // 10% in bps
       });
       const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet, newPosition]);
       txHashes.push(txHash);
+      addExecutedLayer(firstLayer);
+      await addRemainingLayers(1);
     }
 
     log("deploy", `SUCCESS — ${txHashes.length} tx(s): ${txHashes[0]}`);
@@ -882,8 +1051,9 @@ export async function deployPosition({
       position: newPosition.publicKey.toString(),
       pool: pool_address,
       pool_name,
-      strategy: activeStrategy,
+      strategy: effectiveStrategy,
       bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
+      layers: executedLayers,
       bin_step,
       volatility: normalizedVolatility,
       fee_tvl_ratio,
@@ -897,6 +1067,7 @@ export async function deployPosition({
       entry_tvl,
       entry_volume,
       entry_holders,
+      notes: initialNotes,
     });
 
     appendDecision({
@@ -905,15 +1076,18 @@ export async function deployPosition({
       pool: pool_address,
       pool_name,
       position: newPosition.publicKey.toString(),
-      summary: `Deployed ${finalAmountY} SOL with ${activeStrategy}`,
+      summary: `Deployed ${finalAmountY} SOL with ${effectiveStrategy}${initialNotes.length ? " (partial layers)" : ""}`,
       reason: `Chosen range ${minBinId}→${maxBinId} around active bin ${activeBin.binId}`,
       risks: [
         normalizedVolatility != null ? `volatility ${normalizedVolatility}` : null,
         fee_tvl_ratio != null ? `fee/TVL ${fee_tvl_ratio}%` : null,
+        layerPlan.fallbackReason ? `multi-layer fallback: ${layerPlan.fallbackReason}` : null,
+        initialNotes.length ? initialNotes.join("; ") : null,
       ].filter(Boolean),
       metrics: {
         amount_sol: finalAmountY,
-        strategy: activeStrategy,
+        strategy: effectiveStrategy,
+        layers: executedLayers,
         active_bin: activeBin.binId,
         min_bin: minBinId,
         max_bin: maxBinId,
@@ -937,7 +1111,9 @@ export async function deployPosition({
       },
       bin_step: actualBinStep,
       base_fee: actualBaseFee,
-      strategy: activeStrategy,
+      strategy: effectiveStrategy,
+      layers: executedLayers,
+      layer_warnings: initialNotes,
       wide_range: isWideRange,
       amount_x: finalAmountX,
       amount_y: finalAmountY,

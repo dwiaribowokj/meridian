@@ -19,6 +19,18 @@
   "minBinsBelow": 35,
   "maxBinsBelow": 69,
   "defaultBinsBelow": 69,
+  "multiLayerEnabled": false,
+  "multiLayerMode": "same_position",
+  "multiLayerLayers": [
+    { "strategy": "bid_ask", "pct": 70 },
+    { "strategy": "spot", "pct": 30 }
+  ],
+  "multiLayerMinLayerSol": 0.05,
+  "multiLayerPrimaryStrategy": "bid_ask",
+  "multiLayerSecondaryStrategy": "spot",
+  "multiLayerPrimaryPct": 70,
+  "multiLayerSecondaryPct": 30,
+  "multiLayerMinSecondarySol": 0.05,
 
   "timeframe": "5m",
   "category": "trending",

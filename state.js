@@ -62,6 +62,7 @@ export function trackPosition({
   bin_range = {},
   amount_sol,
   amount_x = 0,
+  layers = null,
   active_bin,
   bin_step,
   volatility,
@@ -73,6 +74,7 @@ export function trackPosition({
   entry_tvl = null,
   entry_volume = null,
   entry_holders = null,
+  notes = [],
 }) {
   const state = load();
   state.positions[position] = {
@@ -83,6 +85,7 @@ export function trackPosition({
     bin_range,
     amount_sol,
     amount_x,
+    layers,
     active_bin_at_deploy: active_bin,
     bin_step,
     volatility,
@@ -102,7 +105,7 @@ export function trackPosition({
     rebalance_count: 0,
     closed: false,
     closed_at: null,
-    notes: [],
+    notes: Array.isArray(notes) ? notes.map((note) => sanitizeStoredText(note)).filter(Boolean) : [],
     peak_pnl_pct: 0,
     pending_peak_pnl_pct: null,
     pending_peak_confirm_count: 0,
@@ -128,6 +131,7 @@ export function trackPaperPosition({
   bin_range = {},
   amount_sol,
   amount_x = 0,
+  layers = null,
   active_bin,
   bin_step,
   volatility,
@@ -140,6 +144,7 @@ export function trackPaperPosition({
   downside_coverage_pct,
   upside_coverage_pct,
   total_width_pct,
+  notes = [],
 }) {
   const state = load();
   if (!state.paperPositions) state.paperPositions = {};
@@ -153,6 +158,7 @@ export function trackPaperPosition({
     bin_range,
     amount_sol,
     amount_x,
+    layers,
     active_bin_at_deploy: active_bin,
     bin_step,
     volatility,
@@ -172,7 +178,7 @@ export function trackPaperPosition({
     last_active_price: null,
     in_range: null,
     price_change_pct: null,
-    notes: [],
+    notes: Array.isArray(notes) ? notes.map((note) => sanitizeStoredText(note)).filter(Boolean) : [],
   };
   pushEvent(state, { action: "paper_deploy", position: paperId, pool_name: pool_name || pool });
   save(state);

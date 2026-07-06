@@ -205,6 +205,32 @@ function coerceStringArray(value, key) {
   return value.map((entry) => coerceString(entry, key)).filter(Boolean);
 }
 
+function coerceMultiLayerLayers(value, key) {
+  if (!Array.isArray(value)) throw new Error(`${key} must be an array of layer objects`);
+  const layers = value.map((layer, index) => {
+    if (!layer || typeof layer !== "object" || Array.isArray(layer)) {
+      throw new Error(`${key}[${index}] must be an object`);
+    }
+    const strategy = coerceString(layer.strategy, `${key}[${index}].strategy`);
+    const pct = coerceFiniteNumber(layer.pct, `${key}[${index}].pct`);
+    if (pct <= 0) throw new Error(`${key}[${index}].pct must be > 0`);
+    return { strategy, pct };
+  });
+  const totalPct = layers.reduce((sum, layer) => sum + layer.pct, 0);
+  if (Math.abs(totalPct - 100) > 0.0001) throw new Error(`${key} pct total must be 100`);
+  return layers;
+}
+
+function normalizeMultiLayerLayersFromStrategy(strategyConfig) {
+  const layers = Array.isArray(strategyConfig.multiLayerLayers) && strategyConfig.multiLayerLayers.length > 0
+    ? strategyConfig.multiLayerLayers
+    : [
+        { strategy: strategyConfig.multiLayerPrimaryStrategy ?? "bid_ask", pct: strategyConfig.multiLayerPrimaryPct ?? 70 },
+        { strategy: strategyConfig.multiLayerSecondaryStrategy ?? "spot", pct: strategyConfig.multiLayerSecondaryPct ?? 30 },
+      ];
+  return coerceMultiLayerLayers(layers, "multiLayerLayers");
+}
+
 function normalizeConfigValue(key, value) {
   const booleanKeys = new Set([
     "excludeHighSupplyConcentration",
@@ -216,8 +242,10 @@ function normalizeConfigValue(key, value) {
     "solMode",
     "darwinEnabled",
     "lpAgentRelayEnabled",
+    "multiLayerEnabled",
   ]);
   const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads"]);
+  const layerArrayKeys = new Set(["multiLayerLayers"]);
   const stringKeys = new Set([
     "timeframe",
     "category",
@@ -236,10 +264,14 @@ function normalizeConfigValue(key, value) {
     "pnlRpcUrl",
     "gmgnFeeSource",
     "gmgnApiKey",
+    "multiLayerMode",
+    "multiLayerPrimaryStrategy",
+    "multiLayerSecondaryStrategy",
   ]);
   if (value === null) return null;
   if (booleanKeys.has(key)) return coerceBoolean(value, key);
   if (arrayKeys.has(key)) return coerceStringArray(value, key);
+  if (layerArrayKeys.has(key)) return coerceMultiLayerLayers(value, key);
   if (stringKeys.has(key)) return coerceString(value, key);
   return coerceFiniteNumber(value, key);
 }
@@ -431,6 +463,15 @@ const toolMap = {
       minBinsBelow: ["strategy", "minBinsBelow"],
       maxBinsBelow: ["strategy", "maxBinsBelow"],
       defaultBinsBelow: ["strategy", "defaultBinsBelow"],
+      multiLayerEnabled: ["strategy", "multiLayerEnabled"],
+      multiLayerMode: ["strategy", "multiLayerMode"],
+      multiLayerLayers: ["strategy", "multiLayerLayers"],
+      multiLayerPrimaryStrategy: ["strategy", "multiLayerPrimaryStrategy"],
+      multiLayerSecondaryStrategy: ["strategy", "multiLayerSecondaryStrategy"],
+      multiLayerPrimaryPct: ["strategy", "multiLayerPrimaryPct"],
+      multiLayerSecondaryPct: ["strategy", "multiLayerSecondaryPct"],
+      multiLayerMinLayerSol: ["strategy", "multiLayerMinLayerSol"],
+      multiLayerMinSecondarySol: ["strategy", "multiLayerMinSecondarySol"],
       // hivemind
       hiveMindUrl: ["hiveMind", "url"],
       hiveMindApiKey: ["hiveMind", "apiKey"],
@@ -541,6 +582,15 @@ const toolMap = {
           Math.round(Number(config.strategy.defaultBinsBelow ?? config.strategy.maxBinsBelow)),
         ),
       );
+    }
+    if (
+      applied.multiLayerLayers != null ||
+      applied.multiLayerPrimaryStrategy != null ||
+      applied.multiLayerSecondaryStrategy != null ||
+      applied.multiLayerPrimaryPct != null ||
+      applied.multiLayerSecondaryPct != null
+    ) {
+      config.strategy.multiLayerLayers = applied.multiLayerLayers ?? normalizeMultiLayerLayersFromStrategy(config.strategy);
     }
 
     for (const [key, val] of Object.entries(applied)) {

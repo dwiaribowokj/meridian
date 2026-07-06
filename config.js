@@ -65,6 +65,27 @@ function nonEmptyString(...values) {
   return null;
 }
 
+function normalizeMultiLayerLayers(userConfig = {}) {
+  const configuredLayers = Array.isArray(userConfig.multiLayerLayers)
+    ? userConfig.multiLayerLayers
+    : [
+        {
+          strategy: userConfig.multiLayerPrimaryStrategy ?? "bid_ask",
+          pct: userConfig.multiLayerPrimaryPct ?? 70,
+        },
+        {
+          strategy: userConfig.multiLayerSecondaryStrategy ?? "spot",
+          pct: userConfig.multiLayerSecondaryPct ?? 30,
+        },
+      ];
+  return configuredLayers
+    .map((layer) => ({
+      strategy: String(layer?.strategy || "").trim(),
+      pct: Number(layer?.pct),
+    }))
+    .filter((layer) => layer.strategy && Number.isFinite(layer.pct) && layer.pct > 0);
+}
+
 export const config = {
   // ─── Risk Limits ─────────────────────────
   risk: {
@@ -150,6 +171,15 @@ export const config = {
     defaultBinsBelow: strategyDefaultBinsBelow,
     upperBufferBins: Math.max(0, Number(u.upperBufferBins ?? 0)),
     upperBufferDryRunOnly: u.upperBufferDryRunOnly ?? true,
+    multiLayerEnabled: u.multiLayerEnabled ?? false,
+    multiLayerMode: u.multiLayerMode ?? "same_position",
+    multiLayerLayers: normalizeMultiLayerLayers(u),
+    multiLayerPrimaryStrategy: u.multiLayerPrimaryStrategy ?? "bid_ask",
+    multiLayerSecondaryStrategy: u.multiLayerSecondaryStrategy ?? "spot",
+    multiLayerPrimaryPct: Number(u.multiLayerPrimaryPct ?? 70),
+    multiLayerSecondaryPct: Number(u.multiLayerSecondaryPct ?? 30),
+    multiLayerMinLayerSol: Number(u.multiLayerMinLayerSol ?? u.multiLayerMinSecondarySol ?? 0.05),
+    multiLayerMinSecondarySol: Number(u.multiLayerMinSecondarySol ?? u.multiLayerMinLayerSol ?? 0.05),
   },
 
   // ─── Scheduling ─────────────────────────
@@ -350,5 +380,22 @@ export function reloadScreeningThresholds() {
       config.strategy.minBinsBelow,
       Math.min(config.strategy.maxBinsBelow, Math.round(defaultBinsBelow)),
     );
+    if (fresh.multiLayerEnabled !== undefined) config.strategy.multiLayerEnabled = fresh.multiLayerEnabled;
+    if (fresh.multiLayerMode != null) config.strategy.multiLayerMode = fresh.multiLayerMode;
+    if (fresh.multiLayerPrimaryStrategy != null) config.strategy.multiLayerPrimaryStrategy = fresh.multiLayerPrimaryStrategy;
+    if (fresh.multiLayerSecondaryStrategy != null) config.strategy.multiLayerSecondaryStrategy = fresh.multiLayerSecondaryStrategy;
+    if (fresh.multiLayerPrimaryPct != null) config.strategy.multiLayerPrimaryPct = Number(fresh.multiLayerPrimaryPct);
+    if (fresh.multiLayerSecondaryPct != null) config.strategy.multiLayerSecondaryPct = Number(fresh.multiLayerSecondaryPct);
+    if (
+      fresh.multiLayerLayers !== undefined ||
+      fresh.multiLayerPrimaryStrategy != null ||
+      fresh.multiLayerSecondaryStrategy != null ||
+      fresh.multiLayerPrimaryPct != null ||
+      fresh.multiLayerSecondaryPct != null
+    ) {
+      config.strategy.multiLayerLayers = normalizeMultiLayerLayers(fresh);
+    }
+    if (fresh.multiLayerMinLayerSol != null) config.strategy.multiLayerMinLayerSol = Number(fresh.multiLayerMinLayerSol);
+    if (fresh.multiLayerMinSecondarySol != null) config.strategy.multiLayerMinSecondarySol = Number(fresh.multiLayerMinSecondarySol);
   } catch { /* ignore */ }
 }

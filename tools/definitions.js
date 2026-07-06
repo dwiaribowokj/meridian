@@ -130,6 +130,8 @@ Only call this if you need the current price to calculate a specific bin range (
 PRIORITY ORDER for strategy and bins:
 1. User explicitly specifies → always follow exactly (user override is absolute)
 2. No user spec → use the configured strategy from config.strategy.strategy and choose bins based on volatility
+   If config.strategy.multiLayerEnabled=true, the default deploy can split SOL into configured layers
+   (for example bid_ask + spot) inside the same position.
 
 HARD RULES:
 - Never use 'curve'.
@@ -141,6 +143,7 @@ HARD RULES:
 
 Guidelines (only when user hasn't specified):
 - Strategy: omit the strategy field — the system will use the configured default from config.strategy.strategy
+  and may apply configured multi-layer mode when enabled.
 - Bins: choose from configured minBinsBelow/maxBinsBelow by positive volatility. The hard lower floor is 35 bins.
 - Deposit: single-sided SOL only: set amount_y/amount_sol, keep amount_x=0.
 
@@ -390,7 +393,7 @@ Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, oorCoo
 Risk: maxPositions, maxDeployAmount
 Schedule: managementIntervalMin, screeningIntervalMin
 Models: managementModel, screeningModel, generalModel
-Strategy: minBinsBelow, maxBinsBelow, defaultBinsBelow (legacy binsBelow maps to maxBinsBelow)
+Strategy: strategy, minBinsBelow, maxBinsBelow, defaultBinsBelow (legacy binsBelow maps to maxBinsBelow), multiLayerEnabled, multiLayerMode, multiLayerLayers, multiLayerPrimaryStrategy, multiLayerSecondaryStrategy, multiLayerPrimaryPct, multiLayerSecondaryPct, multiLayerMinLayerSol, multiLayerMinSecondarySol
 
 Reason is optional but helpful — logged as a lesson when provided.`,
       parameters: {
