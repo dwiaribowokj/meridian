@@ -243,8 +243,10 @@ function normalizeConfigValue(key, value) {
     "darwinEnabled",
     "lpAgentRelayEnabled",
     "multiLayerEnabled",
+    "indicatorHardFilter",
+    "extraSearchOnlySolPools",
   ]);
-  const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads"]);
+  const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads", "extraSearchSymbols"]);
   const layerArrayKeys = new Set(["multiLayerLayers"]);
   const stringKeys = new Set([
     "timeframe",
@@ -401,6 +403,9 @@ const toolMap = {
       blockedLaunchpads: ["screening", "blockedLaunchpads"],
       minTokenAgeHours: ["screening", "minTokenAgeHours"],
       maxTokenAgeHours: ["screening", "maxTokenAgeHours"],
+      extraSearchSymbols: ["screening", "extraSearchSymbols"],
+      extraSearchLimitPerSymbol: ["screening", "extraSearchLimitPerSymbol"],
+      extraSearchOnlySolPools: ["screening", "extraSearchOnlySolPools"],
       minFeePerTvl24h: ["management", "minFeePerTvl24h"],
       loneCandidateMinDegen: ["screening", "loneCandidateMinDegen"],
       // management
@@ -499,6 +504,7 @@ const toolMap = {
       rsiOversold: ["indicators", "rsiOversold", ["chartIndicators", "rsiOversold"]],
       rsiOverbought: ["indicators", "rsiOverbought", ["chartIndicators", "rsiOverbought"]],
       requireAllIntervals: ["indicators", "requireAllIntervals", ["chartIndicators", "requireAllIntervals"]],
+      indicatorHardFilter: ["indicators", "hardFilter", ["chartIndicators", "hardFilter"]],
     };
 
     const applied = {};

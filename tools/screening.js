@@ -9,6 +9,7 @@ import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
+const DLMM_SEARCH_BASE = "https://dlmm.datapi.meteora.ag";
 const MIN_VOLATILITY_TIMEFRAME = "30m";
 const TIMEFRAME_MINUTES = {
   "5m": 5,
@@ -236,6 +237,96 @@ async function fetchPoolDiscoveryDetail({ poolAddress, timeframe }) {
 
   const data = await res.json();
   return (data.data || [])[0] ?? null;
+}
+
+async function fetchDlmmSearchPools({ query, limit }) {
+  const url = `${DLMM_SEARCH_BASE}/pools?query=${encodeURIComponent(query)}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`DLMM pool search ${res.status} ${res.statusText}`);
+  const data = await res.json();
+  return (Array.isArray(data) ? data : data.data || []).slice(0, limit);
+}
+
+function searchPoolAddress(pool) {
+  return pool?.address || pool?.pool_address || null;
+}
+
+function searchPoolToken(pool, side) {
+  return {
+    symbol: pool?.[`mint_${side}_symbol`] ?? pool?.[`token_${side}`]?.symbol ?? null,
+    mint: pool?.[`mint_${side}`] ?? pool?.[`token_${side}`]?.address ?? pool?.[`token_${side}`]?.mint ?? null,
+  };
+}
+
+function isSolSearchPool(pool) {
+  const solMint = config.tokens.SOL;
+  const x = searchPoolToken(pool, "x");
+  const y = searchPoolToken(pool, "y");
+  return x.mint === solMint || y.mint === solMint || x.symbol === "SOL" || y.symbol === "SOL";
+}
+
+async function fetchExtraSearchPools(s) {
+  const symbols = [...new Set((s.extraSearchSymbols || []).map((entry) => String(entry || "").trim()).filter(Boolean))];
+  if (symbols.length === 0) return [];
+
+  const limit = Math.max(1, Math.min(25, Number(s.extraSearchLimitPerSymbol || 6)));
+  const results = await Promise.allSettled(symbols.map(async (symbol) => {
+    const searchPools = await fetchDlmmSearchPools({ query: symbol, limit });
+    const poolRefs = searchPools
+      .filter((pool) => !s.extraSearchOnlySolPools || isSolSearchPool(pool))
+      .map((pool, index) => ({
+        address: searchPoolAddress(pool),
+        name: pool?.name || symbol,
+        symbol,
+        rank: index + 1,
+      }))
+      .filter((pool) => pool.address);
+
+    const detailResults = await Promise.allSettled(poolRefs.map(async (ref) => {
+      const detail = await fetchPoolDiscoveryDetail({ poolAddress: ref.address, timeframe: s.timeframe });
+      if (!detail) return null;
+      detail.extra_search_source = ref.symbol;
+      detail.extra_search_rank = ref.rank;
+      detail.extra_search_name = ref.name;
+      return detail;
+    }));
+
+    return detailResults
+      .filter((result) => result.status === "fulfilled" && result.value)
+      .map((result) => result.value);
+  }));
+
+  const pools = [];
+  for (const result of results) {
+    if (result.status === "fulfilled") {
+      pools.push(...result.value);
+    } else {
+      log("screening", `Extra search source failed: ${result.reason?.message || result.reason}`);
+    }
+  }
+  return pools;
+}
+
+function mergeExtraSearchPools(rawPools, extraPools) {
+  if (!extraPools.length) return { rawPools, added: 0, merged: 0 };
+
+  const byPool = new Map(rawPools.map((pool) => [pool.pool_address, pool]));
+  let added = 0;
+  let merged = 0;
+  for (const extra of extraPools) {
+    if (!extra?.pool_address) continue;
+    const existing = byPool.get(extra.pool_address);
+    if (existing) {
+      existing.extra_search_source = extra.extra_search_source;
+      existing.extra_search_rank = extra.extra_search_rank;
+      existing.extra_search_name = extra.extra_search_name;
+      merged += 1;
+      continue;
+    }
+    byPool.set(extra.pool_address, extra);
+    added += 1;
+  }
+  return { rawPools: Array.from(byPool.values()), added, merged };
 }
 
 async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
@@ -518,6 +609,16 @@ export async function discoverPools({
     }
   }
 
+  const extraSearchPools = await fetchExtraSearchPools(s).catch((error) => {
+    log("screening", `Extra search fetch failed: ${error.message}`);
+    return [];
+  });
+  if (extraSearchPools.length > 0) {
+    const merged = mergeExtraSearchPools(rawPools, extraSearchPools);
+    rawPools = merged.rawPools;
+    log("screening", `Extra search merged ${extraSearchPools.length} pool(s): added=${merged.added}, tagged=${merged.merged}`);
+  }
+
   rawPools = await applyVolatilityTimeframe(rawPools, s.timeframe);
   await enrichDiscordSignalLaunchpads(rawPools);
 
@@ -702,18 +803,29 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       }),
     );
     const confirmationByPool = new Map(confirmations.map((entry) => [entry.pool, entry.confirmation]));
-    const before = eligible.length;
-    const confirmedEligible = eligible.filter((pool) => {
+    let rejectedCount = 0;
+    for (const pool of eligible) {
       const confirmation = confirmationByPool.get(pool.pool);
       pool.indicator_confirmation = confirmation || null;
-      if (!confirmation || confirmation.confirmed) return true;
-      pushFilteredReason(filteredOut, pool, `indicator reject: ${confirmation.reason}`);
-      log("screening", `Indicator rejected ${pool.name} (${pool.pool.slice(0, 8)}): ${confirmation.reason}`);
-      return false;
-    });
-    eligible.splice(0, eligible.length, ...confirmedEligible);
-    if (eligible.length < before) {
-      log("screening", `Indicator confirmation removed ${before - eligible.length} candidate(s)`);
+      if (confirmation && !confirmation.confirmed) {
+        rejectedCount += 1;
+        log("screening", `Indicator soft reject ${pool.name} (${pool.pool.slice(0, 8)}): ${confirmation.reason}`);
+      }
+    }
+    if (config.indicators.hardFilter) {
+      const before = eligible.length;
+      const confirmedEligible = eligible.filter((pool) => {
+        const confirmation = confirmationByPool.get(pool.pool);
+        if (!confirmation || confirmation.confirmed) return true;
+        pushFilteredReason(filteredOut, pool, `indicator reject: ${confirmation.reason}`);
+        return false;
+      });
+      eligible.splice(0, eligible.length, ...confirmedEligible);
+      if (eligible.length < before) {
+        log("screening", `Indicator confirmation removed ${before - eligible.length} candidate(s)`);
+      }
+    } else if (rejectedCount > 0) {
+      log("screening", `Indicator context attached; ${rejectedCount} candidate(s) were not confirmed but kept for LLM review`);
     }
   }
 
@@ -792,6 +904,8 @@ function condensePool(p) {
     active_positions: p.active_positions,
     active_pct: fix(p.active_positions_pct, 1),
     open_positions: p.open_positions,
+    extra_search_source: p.extra_search_source || null,
+    extra_search_rank: p.extra_search_rank || null,
     discord_signal: Boolean(p.discord_signal),
     discord_signal_count: p.discord_signal_count || 0,
     discord_signal_seen_count: p.discord_signal_seen_count || 0,

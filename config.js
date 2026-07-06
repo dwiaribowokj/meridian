@@ -86,6 +86,12 @@ function normalizeMultiLayerLayers(userConfig = {}) {
     .filter((layer) => layer.strategy && Number.isFinite(layer.pct) && layer.pct > 0);
 }
 
+function normalizeStringList(value) {
+  return Array.isArray(value)
+    ? value.map((entry) => String(entry || "").trim()).filter(Boolean)
+    : [];
+}
+
 export const config = {
   // ─── Risk Limits ─────────────────────────
   risk: {
@@ -121,6 +127,9 @@ export const config = {
     blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
+    extraSearchSymbols: normalizeStringList(u.extraSearchSymbols),
+    extraSearchLimitPerSymbol: Number(u.extraSearchLimitPerSymbol ?? 6),
+    extraSearchOnlySolPools: u.extraSearchOnlySolPools ?? true,
   },
 
   // ─── Position Management ────────────────
@@ -143,6 +152,10 @@ export const config = {
     takeProfitPct:         u.takeProfitPct         ?? u.takeProfitFeePct ?? 5,
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
+    deadPositionCheck1Minutes: u.deadPositionCheck1Minutes ?? 90,
+    deadPositionCheck1MaxPeakPct: u.deadPositionCheck1MaxPeakPct ?? 0.5,
+    deadPositionCheck2Minutes: u.deadPositionCheck2Minutes ?? 120,
+    deadPositionCheck2MaxPeakPct: u.deadPositionCheck2MaxPeakPct ?? 0.8,
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
     deployAmountSol:       u.deployAmountSol       ?? 0.5,
     gasReserve:            u.gasReserve            ?? 0.2,
@@ -157,6 +170,10 @@ export const config = {
     dynamicStopBasePct:     u.dynamicStopBasePct     ?? u.stopLossPct ?? u.emergencyPriceDropPct ?? -50,
     breakevenTriggerPct:    u.breakevenTriggerPct    ?? 1.0,
     breakevenStopPct:       u.breakevenStopPct       ?? 0.5,
+    profitProtectTriggerPct: u.profitProtectTriggerPct ?? 2.0,
+    profitProtectStopPct:    u.profitProtectStopPct ?? 1.0,
+    retraceCloseTriggerPct:  u.retraceCloseTriggerPct ?? 1.5,
+    retraceClosePct:         u.retraceClosePct ?? 50,
     dynamicStopMinAgeMinutes: u.dynamicStopMinAgeMinutes ?? 10,
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
@@ -310,6 +327,7 @@ export const config = {
     rsiOversold: indicatorUserConfig.rsiOversold ?? 30,
     rsiOverbought: indicatorUserConfig.rsiOverbought ?? 80,
     requireAllIntervals: indicatorUserConfig.requireAllIntervals ?? false,
+    hardFilter: indicatorUserConfig.hardFilter ?? false,
   },
 };
 
@@ -371,6 +389,9 @@ export function reloadScreeningThresholds() {
     if (fresh.maxBotHoldersPct  != null) s.maxBotHoldersPct = fresh.maxBotHoldersPct;
     if (fresh.allowedLaunchpads !== undefined) s.allowedLaunchpads = fresh.allowedLaunchpads;
     if (fresh.blockedLaunchpads !== undefined) s.blockedLaunchpads = fresh.blockedLaunchpads;
+    if (fresh.extraSearchSymbols !== undefined) s.extraSearchSymbols = normalizeStringList(fresh.extraSearchSymbols);
+    if (fresh.extraSearchLimitPerSymbol != null) s.extraSearchLimitPerSymbol = Number(fresh.extraSearchLimitPerSymbol);
+    if (fresh.extraSearchOnlySolPools !== undefined) s.extraSearchOnlySolPools = fresh.extraSearchOnlySolPools;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelow = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;

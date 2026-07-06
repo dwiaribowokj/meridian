@@ -567,6 +567,31 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     };
   }
 
+  // ── Profit protection / retrace exits ──────────────────────────
+  if (!pnl_pct_suspicious && currentPnlPct != null) {
+    const peakPnlPct = pos.peak_pnl_pct ?? 0;
+    const profitProtectTriggerPct = Number(mgmtConfig.profitProtectTriggerPct ?? 2.0);
+    const profitProtectStopPct = Number(mgmtConfig.profitProtectStopPct ?? 1.0);
+    if (peakPnlPct >= profitProtectTriggerPct && currentPnlPct <= profitProtectStopPct) {
+      return {
+        action: "PROFIT_PROTECT",
+        reason: `Profit protect: peak ${peakPnlPct.toFixed(2)}% >= ${profitProtectTriggerPct}% and current ${currentPnlPct.toFixed(2)}% <= ${profitProtectStopPct}%`,
+      };
+    }
+
+    const retraceCloseTriggerPct = Number(mgmtConfig.retraceCloseTriggerPct ?? 1.5);
+    const retraceClosePct = Number(mgmtConfig.retraceClosePct ?? 50);
+    if (peakPnlPct >= retraceCloseTriggerPct && peakPnlPct > 0) {
+      const retracePct = ((peakPnlPct - currentPnlPct) / peakPnlPct) * 100;
+      if (retracePct >= retraceClosePct) {
+        return {
+          action: "RETRACE_CLOSE",
+          reason: `Retrace close: peak ${peakPnlPct.toFixed(2)}% retraced ${retracePct.toFixed(2)}% >= ${retraceClosePct}% (current ${currentPnlPct.toFixed(2)}%)`,
+        };
+      }
+    }
+  }
+
   // ── Trailing TP ────────────────────────────────────────────────
   if (!pnl_pct_suspicious && pos.trailing_active) {
     const dropFromPeak = pos.peak_pnl_pct - currentPnlPct;
@@ -606,6 +631,28 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
       action: "LOW_YIELD",
       reason: `Low yield: fee/TVL ${fee_per_tvl_24h.toFixed(2)}% < min ${mgmtConfig.minFeePerTvl24h}% (age: ${age_minutes ?? "?"}m)`,
     };
+  }
+
+  // ── Dead position / low-productivity timeout ───────────────────
+  if (!pnl_pct_suspicious && currentPnlPct != null && age_minutes != null) {
+    const peakPnlPct = pos.peak_pnl_pct ?? 0;
+    const dead1Minutes = Number(mgmtConfig.deadPositionCheck1Minutes ?? 90);
+    const dead1MaxPeakPct = Number(mgmtConfig.deadPositionCheck1MaxPeakPct ?? 0.5);
+    if (age_minutes >= dead1Minutes && peakPnlPct < dead1MaxPeakPct) {
+      return {
+        action: "DEAD_POSITION",
+        reason: `Dead position: age ${age_minutes}m >= ${dead1Minutes}m and peak ${peakPnlPct.toFixed(2)}% < ${dead1MaxPeakPct}%`,
+      };
+    }
+
+    const dead2Minutes = Number(mgmtConfig.deadPositionCheck2Minutes ?? 120);
+    const dead2MaxPeakPct = Number(mgmtConfig.deadPositionCheck2MaxPeakPct ?? 0.8);
+    if (age_minutes >= dead2Minutes && peakPnlPct < dead2MaxPeakPct) {
+      return {
+        action: "DEAD_POSITION",
+        reason: `Dead position: age ${age_minutes}m >= ${dead2Minutes}m and peak ${peakPnlPct.toFixed(2)}% < ${dead2MaxPeakPct}%`,
+      };
+    }
   }
 
   return null;

@@ -488,6 +488,9 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `maxBotHoldersPct` | `30` | Maximum bot holder % (Jupiter audit) |
 | `maxTop10Pct` | `60` | Maximum top-10 holder concentration |
 | `blockedLaunchpads` | `[]` | Launchpad names to never deploy into |
+| `extraSearchSymbols` | `[]` | Extra token symbols to search and merge into screening candidates |
+| `extraSearchLimitPerSymbol` | `6` | Max search results to inspect for each extra symbol |
+| `extraSearchOnlySolPools` | `true` | Keep extra search limited to SOL pairs |
 
 ### Management
 

@@ -58,6 +58,32 @@ if (isMain) {
 const TP_PCT = config.management.takeProfitPct;
 const DEPLOY = config.management.deployAmountSol;
 
+function formatIndicatorSignal(value) {
+  if (value == null) return "?";
+  if (typeof value === "number" && Number.isFinite(value)) return Number(value.toFixed(6));
+  return value;
+}
+
+function formatIndicatorContext(confirmation) {
+  if (!confirmation?.enabled) return null;
+  if (confirmation.skipped) return `indicator: unavailable - ${confirmation.reason}`;
+  const intervalLines = (confirmation.intervals || []).slice(0, 2).map((entry) => {
+    if (!entry.ok) return `${entry.interval}: unavailable (${entry.reason})`;
+    const signal = entry.signal || {};
+    const parts = [
+      `${entry.interval}: ${entry.confirmed ? "confirmed" : "not_confirmed"}`,
+      `reason=${entry.reason}`,
+      signal.rsi != null ? `rsi=${formatIndicatorSignal(signal.rsi)}` : null,
+      signal.supertrendDirection ? `st=${signal.supertrendDirection}` : null,
+      signal.close != null ? `close=${formatIndicatorSignal(signal.close)}` : null,
+      signal.supertrendValue != null ? `st_value=${formatIndicatorSignal(signal.supertrendValue)}` : null,
+    ].filter(Boolean);
+    return parts.join(", ");
+  });
+  const mode = config.indicators.hardFilter ? "hard" : "soft";
+  return `indicator(${mode}): ${confirmation.confirmed ? "confirmed" : "not_confirmed"} - ${confirmation.reason}${intervalLines.length ? ` | ${intervalLines.join(" | ")}` : ""}`;
+}
+
 // ═══════════════════════════════════════════
 //  CYCLE TIMERS
 // ═══════════════════════════════════════════
@@ -92,6 +118,7 @@ let _cronTasks = [];
 let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
+let _screeningQueuedWhileBusy = false; // coalesce repeated trigger attempts while a screening run is active
 // Exit/peak confirmation is now done by consecutive-tick counting in state.js
 // (registerExitSignal / confirmPeak), driven by the 3s RPC poller — no setTimeout rechecks.
 
@@ -236,10 +263,16 @@ export async function runManagementCycle({ silent = false } = {}) {
     positions = livePositions?.positions || [];
 
     if (positions.length === 0) {
-      log("cron", "No open positions — triggering screening cycle");
-      mgmtReport = "No open positions. Triggering screening cycle.";
-      await liveMessage?.note("No open positions — triggering screening.").catch(() => {});
-      runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+      if (_screeningBusy) {
+        log("cron", "No open positions — screening already running; management will not trigger another cycle");
+        mgmtReport = "No open positions. Screening already running.";
+        await liveMessage?.note("No open positions — screening already running.").catch(() => {});
+      } else {
+        log("cron", "No open positions — management triggering screening cycle");
+        mgmtReport = "No open positions. Management triggering screening cycle.";
+        await liveMessage?.note("No open positions — management triggering screening.").catch(() => {});
+        runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+      }
       return mgmtReport;
     }
 
@@ -350,8 +383,12 @@ export async function runManagementCycle({ silent = false } = {}) {
     const afterPositions = await getMyPositions({ force: true }).catch(() => null);
     const afterCount = afterPositions?.positions?.length ?? 0;
     if (afterCount < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
-      log("cron", `Post-management: ${afterCount}/${config.risk.maxPositions} positions — triggering screening`);
-      runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+      if (_screeningBusy) {
+        log("cron", `Post-management: ${afterCount}/${config.risk.maxPositions} positions — screening already running; skipping duplicate trigger`);
+      } else {
+        log("cron", `Post-management: ${afterCount}/${config.risk.maxPositions} positions — triggering screening`);
+        runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+      }
     }
   } catch (error) {
     log("cron_error", `Management cycle failed: ${error.message}`);
@@ -373,8 +410,9 @@ export async function runManagementCycle({ silent = false } = {}) {
   return mgmtReport;
 }
 
-export async function runScreeningCycle({ silent = false } = {}) {
+export async function runScreeningCycle({ silent = false, fillSlots = true } = {}) {
   if (_screeningBusy) {
+    _screeningQueuedWhileBusy = true;
     log("cron", "Screening skipped — previous cycle still running");
     return null;
   }
@@ -549,6 +587,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
       const priceChange = ti?.stats_1h?.price_change;
       const netBuyers = ti?.stats_1h?.net_buyers;
       const activeBin = activeBinResults[i]?.status === "fulfilled" ? activeBinResults[i].value?.binId : null;
+      const indicatorContext = formatIndicatorContext(pool.indicator_confirmation);
 
       const pvpLine = pool.is_pvp
         ? `  pvp: HIGH — rival ${pool.pvp_rival_name || pool.pvp_symbol} (${pool.pvp_rival_mint?.slice(0, 8)}...) has pool ${pool.pvp_rival_pool?.slice(0, 8)}..., tvl=$${pool.pvp_rival_tvl}, holders=${pool.pvp_rival_holders}, fees=${pool.pvp_rival_fees}SOL`
@@ -556,12 +595,14 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
       const block = [
         `POOL: ${pool.name} (${pool.pool})`,
+        pool.extra_search_source ? `  source: extra_search:${pool.extra_search_source}${pool.extra_search_rank ? ` rank=${pool.extra_search_rank}` : ""}` : null,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
         pvpLine,
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
         activeBin != null ? `  active_bin: ${activeBin}` : null,
         priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
+        indicatorContext ? `  ${indicatorContext}` : null,
         n?.narrative ? `  narrative_untrusted: ${sanitizeUntrustedPromptText(n.narrative, 500)}` : `  narrative_untrusted: none`,
         mem ? `  memory_untrusted: ${sanitizeUntrustedPromptText(mem, 500)}` : null,
       ].filter(Boolean).join("\n");
@@ -599,7 +640,7 @@ ${candidateBlocks.join("\n\n")}
 
 STEPS:
 1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
-2. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
+2. Pick the best candidate based on narrative quality, smart wallets, pool metrics, and indicator context. Indicator/candle context is advisory: strong metrics can override a weak signal, but do not deploy into clearly bearish or stale momentum.
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
    bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
    pass deploy_position.volatility = the candidate volatility value.
@@ -683,6 +724,32 @@ IMPORTANT:
         reason: stripThink(content).slice(0, 500),
       });
     }
+
+    // If a deploy succeeded but capacity remains, immediately run another bounded
+    // screening pass. maxPositions is a capacity target, not just a hard ceiling;
+    // this mirrors the intended main-branch flow of filling open slots while
+    // still stopping naturally on no-candidate, failed deploy, full capacity, or
+    // insufficient SOL.
+    if (fillSlots && deploySucceeded) {
+      const [afterPositions, afterBalance] = await Promise.all([
+        getMyPositions({ force: true }).catch(() => null),
+        getWalletBalances().catch(() => null),
+      ]);
+      const afterCount = afterPositions?.total_positions ?? 0;
+      const minRequired = config.management.deployAmountSol + config.management.gasReserve;
+      const hasCapacity = afterCount < config.risk.maxPositions;
+      const hasBalance = process.env.DRY_RUN === "true" || ((afterBalance?.sol ?? 0) >= minRequired);
+      if (hasCapacity && hasBalance) {
+        log("cron", `Screening fill-slots: ${afterCount}/${config.risk.maxPositions} positions — running another screening pass`);
+        await liveMessage?.note(`Deploy succeeded; ${afterCount}/${config.risk.maxPositions} positions open — filling next slot.`).catch(() => {});
+        _screeningBusy = false;
+        const nextReport = await runScreeningCycle({ silent, fillSlots: true });
+        _screeningBusy = true;
+        if (nextReport) screenReport = [screenReport, "", "---", "", nextReport].filter(Boolean).join("\n");
+      } else if (hasCapacity && !hasBalance) {
+        log("cron", `Screening fill-slots stopped — insufficient SOL (${afterBalance?.sol ?? "?"} < ${minRequired})`);
+      }
+    }
   } catch (error) {
     log("cron_error", `Screening cycle failed: ${error.message}`);
     screenReport = `Screening cycle failed: ${error.message}`;
@@ -707,7 +774,9 @@ export function startCronJobs() {
     await runManagementCycle();
   });
 
-  const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
+  // Option A: empty-state screening is driven by the management cycle.
+  // Keep periodic screening cron disabled to avoid dual trigger sources.
+  const screenTask = null;
 
   const healthTask = cron.schedule(`0 * * * *`, async () => {
     if (_managementBusy) return;
@@ -842,7 +911,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
     }, oppMs);
   }
 
-  _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog];
+  _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog].filter(Boolean);
   // Store interval refs so stopCronJobs can clear them
   _cronTasks._pnlPollInterval = pnlPollInterval;
   _cronTasks._opportunityPollInterval = opportunityPollInterval;
