@@ -584,6 +584,8 @@ export async function runScreeningCycle({ silent = false, fillSlots = true } = {
       const top10Pct = ti?.audit?.top_holders_pct ?? "?";
       const feesSol = ti?.global_fees_sol ?? "?";
       const launchpad = ti?.launchpad ?? null;
+      const warningTypes = Array.isArray(pool.base?.warning_types) ? pool.base.warning_types : [];
+      const warningText = warningTypes.length ? `, warnings=${warningTypes.join("|")}` : "";
       const priceChange = ti?.stats_1h?.price_change;
       const netBuyers = ti?.stats_1h?.net_buyers;
       const activeBin = activeBinResults[i]?.status === "fulfilled" ? activeBinResults[i].value?.binId : null;
@@ -597,7 +599,7 @@ export async function runScreeningCycle({ silent = false, fillSlots = true } = {
         `POOL: ${pool.name} (${pool.pool})`,
         pool.extra_search_source ? `  source: extra_search:${pool.extra_search_source}${pool.extra_search_rank ? ` rank=${pool.extra_search_rank}` : ""}` : null,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
-        `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
+        `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}${warningText}`,
         pvpLine,
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
         activeBin != null ? `  active_bin: ${activeBin}` : null,
@@ -640,7 +642,7 @@ ${candidateBlocks.join("\n\n")}
 
 STEPS:
 1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
-2. Pick the best candidate based on narrative quality, smart wallets, pool metrics, and indicator context. Indicator/candle context is advisory: strong metrics can override a weak signal, but do not deploy into clearly bearish or stale momentum.
+2. Pick the best candidate based on narrative quality, smart wallets, pool metrics, audit warnings, and indicator context. Indicator/candle context is advisory: strong metrics can override a weak signal, but do not deploy into clearly bearish or stale momentum. Treat HIGH_SINGLE_OWNERSHIP, high top10 concentration, and unconfirmed indicator context as serious negatives that require exceptional live fee/volume strength to override.
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
    bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
    pass deploy_position.volatility = the candidate volatility value.

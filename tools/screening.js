@@ -864,6 +864,9 @@ function condensePool(p) {
       mint: p.token_x?.address,
       organic: Math.round(p.token_x?.organic_score || 0),
       warnings: p.token_x?.warnings?.length || 0,
+      warning_types: Array.isArray(p.token_x?.warnings)
+        ? p.token_x.warnings.map((warning) => warning?.type).filter(Boolean).slice(0, 5)
+        : [],
     },
     quote: {
       symbol: p.token_y?.symbol,
