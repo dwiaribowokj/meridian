@@ -1097,9 +1097,142 @@ function formatConfigSnapshot() {
     `Repeat deploy cooldown: ${config.management.repeatDeployCooldownEnabled ? "on" : "off"} | ${config.management.repeatDeployCooldownTriggerCount}x / ${config.management.repeatDeployCooldownHours}h | min fee earned ${config.management.repeatDeployCooldownMinFeeEarnedPct}% | ${config.management.repeatDeployCooldownScope}`,
     `Yield floor: ${config.management.minFeePerTvl24h}% | min age ${config.management.minAgeBeforeYieldCheck}m`,
     `Screening: ${config.screening.category} / ${config.screening.timeframe} | TVL ${config.screening.minTvl}-${config.screening.maxTvl}`,
+    `Extra search: ${formatExtraSearchSymbolsInline()} | limit ${config.screening.extraSearchLimitPerSymbol} | SOL only ${config.screening.extraSearchOnlySolPools ? "yes" : "no"}`,
     `Intervals: manage ${config.schedule.managementIntervalMin}m | screen ${config.schedule.screeningIntervalMin}m`,
     `HiveMind: ${isHiveMindEnabled() ? "enabled" : "disabled"}${config.hiveMind.agentId ? ` | ${config.hiveMind.agentId}` : ""}`,
   ].join("\n");
+}
+
+function isMintLikeSymbol(value) {
+  return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(String(value || "").trim());
+}
+
+function normalizeExtraSearchSymbol(value) {
+  let symbol = String(value || "")
+    .trim()
+    .replace(/^[$\s]+/, "")
+    .replace(/\s+/g, " ");
+  if (
+    (symbol.startsWith('"') && symbol.endsWith('"')) ||
+    (symbol.startsWith("'") && symbol.endsWith("'")) ||
+    (symbol.startsWith("`") && symbol.endsWith("`"))
+  ) {
+    symbol = symbol.slice(1, -1).trim();
+  }
+  symbol = symbol.replace(/,+$/g, "").trim();
+  if (!symbol || symbol.length > 80 || symbol.startsWith("/")) return "";
+  return isMintLikeSymbol(symbol) ? symbol : symbol.toUpperCase();
+}
+
+function extraSearchSymbolKey(symbol) {
+  const value = String(symbol || "").trim();
+  return isMintLikeSymbol(value) ? `mint:${value}` : `query:${value.toUpperCase()}`;
+}
+
+function getExtraSearchSymbols() {
+  return Array.isArray(config.screening.extraSearchSymbols)
+    ? config.screening.extraSearchSymbols.map((entry) => String(entry || "").trim()).filter(Boolean)
+    : [];
+}
+
+function dedupeExtraSearchSymbols(symbols) {
+  const seen = new Set();
+  const deduped = [];
+  for (const raw of symbols || []) {
+    const symbol = normalizeExtraSearchSymbol(raw);
+    if (!symbol) continue;
+    const key = extraSearchSymbolKey(symbol);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(symbol);
+  }
+  return deduped;
+}
+
+function formatExtraSearchSymbolsInline(symbols = getExtraSearchSymbols()) {
+  const current = dedupeExtraSearchSymbols(symbols);
+  return current.length ? current.join(", ") : "(empty)";
+}
+
+function formatExtraSearchStatus(symbols = getExtraSearchSymbols()) {
+  const current = dedupeExtraSearchSymbols(symbols);
+  const list = current.length
+    ? current.map((symbol, index) => `${index + 1}. ${symbol}`).join("\n")
+    : "(empty)";
+  return [
+    "Extra search symbols",
+    "",
+    list,
+    "",
+    `Limit per symbol: ${config.screening.extraSearchLimitPerSymbol}`,
+    `SOL pools only: ${config.screening.extraSearchOnlySolPools ? "yes" : "no"}`,
+    "Applies on next screening cycle. No restart needed for symbol changes.",
+  ].join("\n");
+}
+
+async function updateExtraSearchSymbols(symbols, reason) {
+  const next = dedupeExtraSearchSymbols(symbols);
+  const result = await executeTool("update_config", {
+    changes: { extraSearchSymbols: next },
+    reason,
+  });
+  if (!result?.success) {
+    throw new Error(result?.error || `Config update failed. Unknown: ${(result?.unknown || []).join(", ") || "none"}`);
+  }
+  return next;
+}
+
+async function handleExtraSearchCommand(text) {
+  if (/^\/(?:extra|extras|watch)(?:@\w+)?$/i.test(text)) {
+    await sendMessage(formatExtraSearchStatus()).catch(() => {});
+    return true;
+  }
+
+  const addExtraMatch = text.match(/^\/add(?:@\w+)?(?:\s+(.+))?$/i);
+  if (addExtraMatch) {
+    try {
+      const symbol = normalizeExtraSearchSymbol(addExtraMatch[1]);
+      if (!symbol) {
+        await sendMessage(`Usage: /add <symbol_or_mint>\n\n${formatExtraSearchStatus()}`).catch(() => {});
+        return true;
+      }
+      const current = dedupeExtraSearchSymbols(getExtraSearchSymbols());
+      if (current.some((entry) => extraSearchSymbolKey(entry) === extraSearchSymbolKey(symbol))) {
+        await sendMessage(`Already tracked: ${symbol}\n\n${formatExtraSearchStatus(current)}`).catch(() => {});
+        return true;
+      }
+      const next = await updateExtraSearchSymbols([...current, symbol], "Telegram slash command /add extraSearchSymbols");
+      await sendMessage(`✅ Added ${symbol}\n\n${formatExtraSearchStatus(next)}`).catch(() => {});
+    } catch (e) {
+      await sendMessage(`Error: ${e.message}`).catch(() => {});
+    }
+    return true;
+  }
+
+  const remExtraMatch = text.match(/^\/rem(?:@\w+)?(?:\s+(.+))?$/i);
+  if (remExtraMatch) {
+    try {
+      const symbol = normalizeExtraSearchSymbol(remExtraMatch[1]);
+      if (!symbol) {
+        await sendMessage(`Usage: /rem <symbol_or_mint>\n\n${formatExtraSearchStatus()}`).catch(() => {});
+        return true;
+      }
+      const current = dedupeExtraSearchSymbols(getExtraSearchSymbols());
+      const target = extraSearchSymbolKey(symbol);
+      const nextRaw = current.filter((entry) => extraSearchSymbolKey(entry) !== target);
+      if (nextRaw.length === current.length) {
+        await sendMessage(`Not found: ${symbol}\n\n${formatExtraSearchStatus(current)}`).catch(() => {});
+        return true;
+      }
+      const next = await updateExtraSearchSymbols(nextRaw, "Telegram slash command /rem extraSearchSymbols");
+      await sendMessage(`✅ Removed ${symbol}\n\n${formatExtraSearchStatus(next)}`).catch(() => {});
+    } catch (e) {
+      await sendMessage(`Error: ${e.message}`).catch(() => {});
+    }
+    return true;
+  }
+
+  return false;
 }
 
 function parseConfigValue(raw) {
@@ -1372,6 +1505,9 @@ function formatHelpText() {
     "/config — show important runtime config",
     "/settings — button menu for common config",
     "/setcfg <key> <value> — update persisted config",
+    "/extra — show extra search tokens",
+    "/add <symbol> — add extra search token",
+    "/rem <symbol> — remove extra search token",
     "/screen — refresh deterministic candidate list",
     "/candidates — show latest cached candidates",
     "/deploy <n> — deploy candidate by cached index",
@@ -1553,6 +1689,9 @@ async function telegramHandler(msg) {
   }
   if (text === "/settings" || text === "/menu" || text === "/configmenu") {
     await showSettingsMenu().catch((e) => sendMessage(`Settings error: ${e.message}`).catch(() => {}));
+    return;
+  }
+  if (await handleExtraSearchCommand(text)) {
     return;
   }
   if (_managementBusy || _screeningBusy || busy) {
