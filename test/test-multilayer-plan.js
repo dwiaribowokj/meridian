@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { buildLayerPlan } from "../tools/dlmm.js";
+import { buildLayerPlan, shouldAllowMultiLayerForStrategy } from "../tools/dlmm.js";
 
 const strategyMap = {
   spot: 0,
@@ -23,6 +23,32 @@ function plan(strategyConfig, extra = {}) {
   assert.equal(result.multiLayer, false);
   assert.equal(result.effectiveStrategy, "bid_ask");
   assert.deepEqual(result.layers.map((layer) => layer.strategy), ["bid_ask"]);
+}
+
+{
+  const strategyConfig = {
+    multiLayerEnabled: true,
+    multiLayerMode: "same_position",
+    multiLayerLayers: [
+      { strategy: "bid_ask", pct: 70 },
+      { strategy: "spot", pct: 30 },
+    ],
+  };
+  assert.equal(shouldAllowMultiLayerForStrategy({
+    strategyWasExplicit: true,
+    activeStrategy: "bid_ask",
+    strategyConfig,
+  }), true);
+  assert.equal(shouldAllowMultiLayerForStrategy({
+    strategyWasExplicit: true,
+    activeStrategy: "spot",
+    strategyConfig,
+  }), false);
+  assert.equal(shouldAllowMultiLayerForStrategy({
+    strategyWasExplicit: false,
+    activeStrategy: "spot",
+    strategyConfig,
+  }), true);
 }
 
 {

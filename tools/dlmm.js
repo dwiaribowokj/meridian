@@ -211,6 +211,22 @@ function buildLayerExecutionPlan(layers, totalYLamports) {
   });
 }
 
+function getConfiguredPrimaryLayerStrategy(strategyConfig = config.strategy) {
+  if (Array.isArray(strategyConfig.multiLayerLayers) && strategyConfig.multiLayerLayers.length > 0) {
+    const first = String(strategyConfig.multiLayerLayers[0]?.strategy || "").trim();
+    if (first) return first;
+  }
+  return String(strategyConfig.multiLayerPrimaryStrategy || strategyConfig.strategy || "bid_ask").trim();
+}
+
+export function shouldAllowMultiLayerForStrategy({
+  strategyWasExplicit,
+  activeStrategy,
+  strategyConfig = config.strategy,
+}) {
+  return !strategyWasExplicit || String(activeStrategy || "").trim() === getConfiguredPrimaryLayerStrategy(strategyConfig);
+}
+
 function signSerializedTransaction(serialized, wallet) {
   const bytes = Buffer.from(serialized, "base64");
   try {
@@ -722,7 +738,7 @@ export async function deployPosition({
     finalAmountX,
     finalAmountY,
     strategyMap,
-    allowMultiLayer: !strategyWasExplicit,
+    allowMultiLayer: shouldAllowMultiLayerForStrategy({ strategyWasExplicit, activeStrategy }),
   });
   const effectiveStrategy = layerPlan.effectiveStrategy;
   const layerMetadata = layerPlan.layers.map(publicLayer);
