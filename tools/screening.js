@@ -1,4 +1,4 @@
-import { config } from "../config.js";
+import { config, reloadScreeningThresholds } from "../config.js";
 import { isBlacklisted } from "../token-blacklist.js";
 import { isDevBlocked, getBlockedDevs } from "../dev-blocklist.js";
 import { log } from "../logger.js";
@@ -524,6 +524,7 @@ async function refreshDiscordOnlyPools(pools, timeframe) {
 export async function discoverPools({
   page_size = 50,
 } = {}) {
+  reloadScreeningThresholds();
   const s = config.screening;
   const filters = [
     "base_token_has_critical_warnings=false",
