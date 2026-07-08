@@ -107,6 +107,7 @@ export function trackPosition({
     closed_at: null,
     notes: Array.isArray(notes) ? notes.map((note) => sanitizeStoredText(note)).filter(Boolean) : [],
     peak_pnl_pct: 0,
+    peak_pnl_confirmed_at: null,
     pending_peak_pnl_pct: null,
     pending_peak_confirm_count: 0,
     pending_peak_started_at: null,
@@ -298,6 +299,7 @@ export function confirmPeak(position_address, candidatePnlPct, confirmTicks = 2)
     if (pos.pending_peak_pnl_pct != null) {
       pos.pending_peak_pnl_pct = null;
       pos.pending_peak_confirm_count = 0;
+      pos.pending_peak_started_at = null;
       save(state);
     }
     return false;
@@ -316,6 +318,7 @@ export function confirmPeak(position_address, candidatePnlPct, confirmTicks = 2)
 
   if (pos.pending_peak_confirm_count >= confirmTicks) {
     pos.peak_pnl_pct = Math.max(currentPeak, pos.pending_peak_pnl_pct);
+    pos.peak_pnl_confirmed_at = new Date().toISOString();
     pos.pending_peak_pnl_pct = null;
     pos.pending_peak_confirm_count = 0;
     pos.pending_peak_started_at = null;
@@ -396,9 +399,21 @@ function finiteNumber(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+function configNumber(value, fallback) {
+  const n = finiteNumber(value);
+  return n == null ? fallback : n;
+}
+
 function positiveNumber(value) {
   const n = finiteNumber(value);
   return n != null && n > 0 ? n : null;
+}
+
+function minutesSinceIso(iso) {
+  if (!iso) return null;
+  const ts = Date.parse(iso);
+  if (!Number.isFinite(ts)) return null;
+  return Math.max(0, Math.floor((Date.now() - ts) / 60000));
 }
 
 function paperPriceScaleWarning(entryPrice, currentPrice) {
@@ -540,6 +555,11 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     log("state", `Position ${position_address} back in range`);
   }
 
+  if ((pos.peak_pnl_pct ?? 0) > 0 && !pos.peak_pnl_confirmed_at) {
+    pos.peak_pnl_confirmed_at = new Date().toISOString();
+    changed = true;
+  }
+
   if (changed) save(state);
 
   const ageMinutes = positionData.age_minutes;
@@ -569,7 +589,55 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
 
   // ── Profit protection / retrace exits ──────────────────────────
   if (!pnl_pct_suspicious && currentPnlPct != null) {
-    const peakPnlPct = pos.peak_pnl_pct ?? 0;
+    const peakPnlPct = configNumber(pos.peak_pnl_pct, 0);
+
+    if (mgmtConfig.microProfitProtectEnabled !== false) {
+      const microPeakTriggerPct = configNumber(mgmtConfig.microProfitPeakTriggerPct, 0.5);
+      const microRetracePct = configNumber(mgmtConfig.microProfitRetracePct, 45);
+      const microMinCurrentPct = configNumber(mgmtConfig.microProfitMinCurrentPct, 0.05);
+      const microMinAgeMinutes = configNumber(mgmtConfig.microProfitMinAgeMinutes, 8);
+      if (
+        peakPnlPct >= microPeakTriggerPct &&
+        peakPnlPct > 0 &&
+        (ageMinutes == null || ageMinutes >= microMinAgeMinutes)
+      ) {
+        const retracePct = ((peakPnlPct - currentPnlPct) / peakPnlPct) * 100;
+        if (currentPnlPct >= microMinCurrentPct && retracePct >= microRetracePct) {
+          return {
+            action: "MICRO_PROFIT_PROTECT",
+            reason: `Micro profit protect: peak ${peakPnlPct.toFixed(2)}% retraced ${retracePct.toFixed(2)}% >= ${microRetracePct}% while current ${currentPnlPct.toFixed(2)}% >= ${microMinCurrentPct}%`,
+          };
+        }
+      }
+    }
+
+    if (mgmtConfig.peakDecayCloseEnabled !== false) {
+      const peakDecayMinPeakPct = configNumber(mgmtConfig.peakDecayMinPeakPct, 0.4);
+      const peakDecayMinDropPct = configNumber(mgmtConfig.peakDecayMinDropPct, 0.25);
+      const peakDecayMinCurrentPct = configNumber(mgmtConfig.peakDecayMinCurrentPct, 0.02);
+      const peakDecayMinutes = configNumber(mgmtConfig.peakDecayMinutes, 12);
+      const peakDecayMaxFeePerTvl24h = configNumber(
+        mgmtConfig.peakDecayMaxFeePerTvl24h,
+        configNumber(mgmtConfig.minFeePerTvl24h, 3),
+      );
+      const minutesSincePeak = minutesSinceIso(pos.peak_pnl_confirmed_at);
+      const dropFromPeakPct = peakPnlPct - currentPnlPct;
+      if (
+        peakPnlPct >= peakDecayMinPeakPct &&
+        minutesSincePeak != null &&
+        minutesSincePeak >= peakDecayMinutes &&
+        dropFromPeakPct >= peakDecayMinDropPct &&
+        currentPnlPct >= peakDecayMinCurrentPct &&
+        fee_per_tvl_24h != null &&
+        fee_per_tvl_24h <= peakDecayMaxFeePerTvl24h
+      ) {
+        return {
+          action: "PEAK_DECAY_CLOSE",
+          reason: `Peak decay close: peak ${peakPnlPct.toFixed(2)}% was ${minutesSincePeak}m ago, current ${currentPnlPct.toFixed(2)}%, drop ${dropFromPeakPct.toFixed(2)}% >= ${peakDecayMinDropPct}%, fee/TVL ${fee_per_tvl_24h.toFixed(2)}% <= ${peakDecayMaxFeePerTvl24h}%`,
+        };
+      }
+    }
+
     const profitProtectTriggerPct = Number(mgmtConfig.profitProtectTriggerPct ?? 2.0);
     const profitProtectStopPct = Number(mgmtConfig.profitProtectStopPct ?? 1.0);
     if (peakPnlPct >= profitProtectTriggerPct && currentPnlPct <= profitProtectStopPct) {

@@ -179,6 +179,17 @@ export const config = {
     retraceCloseTriggerPct:  u.retraceCloseTriggerPct ?? 1.5,
     retraceClosePct:         u.retraceClosePct ?? 50,
     dynamicStopMinAgeMinutes: u.dynamicStopMinAgeMinutes ?? 10,
+    microProfitProtectEnabled: u.microProfitProtectEnabled ?? true,
+    microProfitPeakTriggerPct: u.microProfitPeakTriggerPct ?? 0.5,
+    microProfitRetracePct:     u.microProfitRetracePct     ?? 45,
+    microProfitMinCurrentPct:  u.microProfitMinCurrentPct  ?? 0.05,
+    microProfitMinAgeMinutes:  u.microProfitMinAgeMinutes  ?? 8,
+    peakDecayCloseEnabled:     u.peakDecayCloseEnabled     ?? true,
+    peakDecayMinPeakPct:       u.peakDecayMinPeakPct       ?? 0.4,
+    peakDecayMinDropPct:       u.peakDecayMinDropPct       ?? 0.25,
+    peakDecayMinCurrentPct:    u.peakDecayMinCurrentPct    ?? 0.02,
+    peakDecayMinutes:          u.peakDecayMinutes          ?? 12,
+    peakDecayMaxFeePerTvl24h:  u.peakDecayMaxFeePerTvl24h  ?? u.minFeePerTvl24h ?? 3,
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
