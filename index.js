@@ -122,6 +122,17 @@ let _screeningQueuedWhileBusy = false; // coalesce repeated trigger attempts whi
 // Exit/peak confirmation is now done by consecutive-tick counting in state.js
 // (registerExitSignal / confirmPeak), driven by the 3s RPC poller — no setTimeout rechecks.
 
+function getPositionCounts(positionResult = null) {
+  const onChain = Number(positionResult?.total_positions ?? positionResult?.positions?.length ?? 0);
+  const tracked = getTrackedPositions(true).length;
+  return {
+    onChain: Number.isFinite(onChain) ? onChain : 0,
+    tracked,
+    effective: Math.max(Number.isFinite(onChain) ? onChain : 0, tracked),
+    hasSettlingTracked: tracked > (Number.isFinite(onChain) ? onChain : 0),
+  };
+}
+
 /** Strip <think>...</think> reasoning blocks that some models leak into output */
 function stripThink(text) {
   if (!text) return text;
@@ -261,8 +272,15 @@ export async function runManagementCycle({ silent = false } = {}) {
     }
     const livePositions = await getMyPositions({ force: true }).catch(() => null);
     positions = livePositions?.positions || [];
+    const positionCounts = getPositionCounts(livePositions);
 
     if (positions.length === 0) {
+      if (positionCounts.tracked > 0) {
+        log("cron", `No indexed positions yet, but ${positionCounts.tracked} tracked position(s) still open — waiting before screening`);
+        mgmtReport = `No indexed positions yet, but ${positionCounts.tracked} tracked position(s) still open. Waiting for indexer/RPC before screening.`;
+        await liveMessage?.note(mgmtReport).catch(() => {});
+        return mgmtReport;
+      }
       if (_screeningBusy) {
         log("cron", "No open positions — screening already running; management will not trigger another cycle");
         mgmtReport = "No open positions. Screening already running.";
@@ -287,7 +305,7 @@ export async function runManagementCycle({ silent = false } = {}) {
     // confirmation lives in the fast 3s poller below.
     const exitMap = new Map();
     for (const p of positionData) {
-      confirmPeak(p.position, p.pnl_pct, 1);
+      if (!p.pnl_pct_suspicious) confirmPeak(p.position, p.pnl_pct, 1);
       const exit = updatePnlAndCheckExits(p.position, p, config.management);
       if (exit) {
         exitMap.set(p.position, exit.reason);
@@ -381,7 +399,7 @@ export async function runManagementCycle({ silent = false } = {}) {
 
     // Trigger screening after management
     const afterPositions = await getMyPositions({ force: true }).catch(() => null);
-    const afterCount = afterPositions?.positions?.length ?? 0;
+    const afterCount = getPositionCounts(afterPositions).effective;
     if (afterCount < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
       if (_screeningBusy) {
         log("cron", `Post-management: ${afterCount}/${config.risk.maxPositions} positions — screening already running; skipping duplicate trigger`);
@@ -425,15 +443,29 @@ export async function runScreeningCycle({ silent = false, fillSlots = true } = {
   let screenReport = null;
   try {
     [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
-    if (prePositions.total_positions >= config.risk.maxPositions) {
-      log("cron", `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`);
-      screenReport = `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions}).`;
+    const preCounts = getPositionCounts(prePositions);
+    if (preCounts.hasSettlingTracked) {
+      log("cron", `Screening skipped — ${preCounts.tracked} tracked position(s) still settling; on-chain reader sees ${preCounts.onChain}`);
+      screenReport = `Screening skipped — ${preCounts.tracked} tracked position(s) still settling; on-chain reader sees ${preCounts.onChain}.`;
       if (!silent && telegramEnabled()) sendMessage(`🔍 Screening skipped\n${screenReport}`).catch(() => {});
       appendDecision({
         type: "skip",
         actor: "SCREENER",
         summary: "Screening skipped",
-        reason: `Max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`,
+        reason: `Tracked positions still settling (${preCounts.tracked} tracked, ${preCounts.onChain} on-chain)`,
+      });
+      _screeningBusy = false;
+      return screenReport;
+    }
+    if (preCounts.effective >= config.risk.maxPositions) {
+      log("cron", `Screening skipped — max positions reached (${preCounts.effective}/${config.risk.maxPositions})`);
+      screenReport = `Screening skipped — max positions reached (${preCounts.effective}/${config.risk.maxPositions}).`;
+      if (!silent && telegramEnabled()) sendMessage(`🔍 Screening skipped\n${screenReport}`).catch(() => {});
+      appendDecision({
+        type: "skip",
+        actor: "SCREENER",
+        summary: "Screening skipped",
+        reason: `Max positions reached (${preCounts.effective}/${config.risk.maxPositions})`,
       });
       _screeningBusy = false;
       return screenReport;
@@ -737,11 +769,14 @@ IMPORTANT:
         getMyPositions({ force: true }).catch(() => null),
         getWalletBalances().catch(() => null),
       ]);
-      const afterCount = afterPositions?.total_positions ?? 0;
+      const afterCounts = getPositionCounts(afterPositions);
+      const afterCount = afterCounts.effective;
       const minRequired = config.management.deployAmountSol + config.management.gasReserve;
       const hasCapacity = afterCount < config.risk.maxPositions;
       const hasBalance = process.env.DRY_RUN === "true" || ((afterBalance?.sol ?? 0) >= minRequired);
-      if (hasCapacity && hasBalance) {
+      if (afterCounts.hasSettlingTracked) {
+        log("cron", `Screening fill-slots paused — ${afterCounts.tracked} tracked position(s), on-chain reader sees ${afterCounts.onChain}`);
+      } else if (hasCapacity && hasBalance) {
         log("cron", `Screening fill-slots: ${afterCount}/${config.risk.maxPositions} positions — running another screening pass`);
         await liveMessage?.note(`Deploy succeeded; ${afterCount}/${config.risk.maxPositions} positions open — filling next slot.`).catch(() => {});
         _screeningBusy = false;
@@ -823,7 +858,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
       const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
       if (!result?.positions?.length) return;
       for (const p of result.positions) {
-        confirmPeak(p.position, p.pnl_pct, confirmTicks);
+        if (!p.pnl_pct_suspicious) confirmPeak(p.position, p.pnl_pct, confirmTicks);
 
         // Detect an exit signal this tick (rule-based exits, then deterministic close rules).
         const exit = updatePnlAndCheckExits(p.position, p, config.management);

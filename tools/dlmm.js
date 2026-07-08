@@ -1393,7 +1393,9 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
     return { wallet: null, total_positions: 0, positions: [], error: "Wallet not configured" };
   }
 
-  const loadPositions = async () => { try {
+  const loadPositions = async () => {
+  let rpcResultForFallback = null;
+  try {
     // ── Primary path: public infra (on-chain RPC + Jupiter + Meteora deposits) ──
     // No LPAgent / agentmeridian dependency, so the poller runs aggressively on
     // fully public resources. Falls through to the Meteora-API path on any error.
@@ -1401,12 +1403,21 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
       try {
         if (!silent) log("positions", `Computing PnL from RPC (${config.pnl.rpcUrl})...`);
         const rpcResult = await computePositions(walletAddress);
-        if (useLocalWallet) {
-          syncOpenPositions(rpcResult.positions.map((p) => p.position));
-          _positionsCache = rpcResult;
-          _positionsCacheAt = Date.now();
+        const allPnlSuspicious =
+          Array.isArray(rpcResult.positions) &&
+          rpcResult.positions.length > 0 &&
+          rpcResult.positions.every((p) => p.pnl_pct_suspicious);
+        if (allPnlSuspicious) {
+          rpcResultForFallback = rpcResult;
+          log("positions_warn", `RPC PnL path returned ${rpcResult.positions.length} suspicious tick(s); falling back to Meteora portfolio API`);
+        } else {
+          if (useLocalWallet) {
+            syncOpenPositions(rpcResult.positions.map((p) => p.position));
+            _positionsCache = rpcResult;
+            _positionsCacheAt = Date.now();
+          }
+          return rpcResult;
         }
-        return rpcResult;
       } catch (error) {
         log("positions_warn", `RPC PnL path failed; falling back to Meteora portfolio API: ${error.message}`);
       }
@@ -1579,6 +1590,15 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
     }
     return result;
   } catch (error) {
+    if (rpcResultForFallback) {
+      log("positions_warn", `Meteora fallback failed after suspicious RPC tick; using RPC result: ${error.message}`);
+      if (useLocalWallet) {
+        syncOpenPositions(rpcResultForFallback.positions.map((p) => p.position));
+        _positionsCache = rpcResultForFallback;
+        _positionsCacheAt = Date.now();
+      }
+      return rpcResultForFallback;
+    }
     log("positions_error", `Portfolio fetch failed: ${error.stack || error.message}`);
     return { wallet: walletAddress, total_positions: 0, positions: [], error: error.message };
   } finally {
