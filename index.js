@@ -1205,6 +1205,34 @@ function formatExtraSearchStatus(symbols = getExtraSearchSymbols()) {
   ].join("\n");
 }
 
+function formatCloseSolLines(result) {
+  const fmt = (value) => {
+    const n = Number(value);
+    return Number.isFinite(n) ? n.toFixed(6) : null;
+  };
+  const lines = [];
+  const pnlSolValue = result.position_sol_pnl ?? result.pnl_sol;
+  const pnlSol = fmt(pnlSolValue);
+  if (pnlSol != null) {
+    const sign = Number(pnlSolValue) >= 0 ? "+" : "";
+    lines.push(`SOL PnL: ${sign}◎${pnlSol}`);
+  }
+  const deployed = fmt(result.position_sol_deployed);
+  const finalSol = fmt(result.position_sol_final);
+  if (deployed != null && finalSol != null) {
+    lines.push(`Position SOL: ◎${deployed} -> ◎${finalSol}`);
+  }
+  const before = fmt(result.wallet_sol_before_deploy);
+  const after = fmt(result.wallet_sol_after_autoswap ?? result.wallet_sol_after_close);
+  const deltaValue = result.wallet_sol_roundtrip_delta_after_autoswap ?? result.wallet_sol_roundtrip_delta;
+  const delta = fmt(deltaValue);
+  if (before != null && after != null) {
+    const sign = Number(deltaValue) >= 0 ? "+" : "";
+    lines.push(`Wallet SOL: ◎${before} -> ◎${after}${delta != null ? ` (${sign}◎${delta})` : ""}`);
+  }
+  return lines;
+}
+
 async function updateExtraSearchSymbols(symbols, reason) {
   const next = dedupeExtraSearchSymbols(symbols);
   const result = await executeTool("update_config", {
@@ -1833,6 +1861,7 @@ async function telegramHandler(msg) {
           `✅ Closed ${pos.pair}`,
           `Reason: ${result.close_reason || "manual /closecooldown"}`,
           `PnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"}${result.pnl_pct != null ? ` (${result.pnl_pct}%)` : ""}`,
+          ...formatCloseSolLines(result),
           `Token cooldown until: ${cooldown.cooldown_until || "n/a"}`,
           `Close txs: ${closeTxs?.join(", ") || "n/a"}`,
         ].join("\n"));
@@ -1915,7 +1944,14 @@ async function telegramHandler(msg) {
       if (result.success) {
         const closeTxs = result.close_txs?.length ? result.close_txs : result.txs;
         const claimNote = result.claim_txs?.length ? `\nClaim txs: ${result.claim_txs.join(", ")}` : "";
-        await sendMessage(`✅ Closed ${pos.pair}\nReason: ${result.close_reason || "manual /close"}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"}${result.pnl_pct != null ? ` (${result.pnl_pct}%)` : ""} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
+        const solLines = formatCloseSolLines(result);
+        await sendMessage([
+          `✅ Closed ${pos.pair}`,
+          `Reason: ${result.close_reason || "manual /close"}`,
+          `PnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"}${result.pnl_pct != null ? ` (${result.pnl_pct}%)` : ""}`,
+          ...solLines,
+          `Close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`,
+        ].join("\n"));
       } else {
         await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
       }

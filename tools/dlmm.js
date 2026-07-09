@@ -20,6 +20,7 @@ import {
   markInRange,
   recordClaim,
   recordClose,
+  recordCloseSolMetrics,
   getTrackedPosition,
   minutesOutOfRange,
   syncOpenPositions,
@@ -110,6 +111,35 @@ function shouldUseLpAgentRelayForDeploy() {
 
 function roundSolAmount(value) {
   return Number(Number(value).toFixed(9));
+}
+
+export async function getNativeSolBalance() {
+  const wallet = getWallet();
+  const lamports = await getConnection().getBalance(wallet.publicKey, "confirmed");
+  return roundSolAmount(lamports / 1e9);
+}
+
+function deriveSolPnlFields({ tracked, initialSol, withdrawnSol, feesSol, pnlSol }) {
+  const deployed = Number(initialSol ?? tracked?.amount_sol ?? 0);
+  const hasWithdrawn = withdrawnSol != null && Number.isFinite(Number(withdrawnSol));
+  const withdrawn = hasWithdrawn ? Number(withdrawnSol) : null;
+  const fees = feesSol != null && Number.isFinite(Number(feesSol)) ? Number(feesSol) : 0;
+  const directPnl = Number(pnlSol);
+  const computedPnl = Number.isFinite(directPnl)
+    ? directPnl
+    : (Number.isFinite(deployed) && deployed > 0 && withdrawn != null ? withdrawn + fees - deployed : null);
+  const finalSol = withdrawn != null ? withdrawn + fees : null;
+  const pct = computedPnl != null && Number.isFinite(computedPnl) && deployed > 0
+    ? (computedPnl / deployed) * 100
+    : null;
+  return {
+    position_sol_deployed: Number.isFinite(deployed) && deployed > 0 ? roundSolAmount(deployed) : null,
+    position_sol_withdrawn: withdrawn != null ? roundSolAmount(withdrawn) : null,
+    position_sol_fees: Number.isFinite(fees) ? roundSolAmount(fees) : null,
+    position_sol_final: finalSol != null ? roundSolAmount(finalSol) : null,
+    position_sol_pnl: computedPnl != null && Number.isFinite(computedPnl) ? roundSolAmount(computedPnl) : null,
+    position_sol_pnl_pct: pct != null && Number.isFinite(pct) ? Math.round(pct * 100) / 100 : null,
+  };
 }
 
 function publicLayer(layer) {
@@ -814,6 +844,7 @@ export async function deployPosition({
   if (useRelayDeploy) {
     try {
       const wallet = getWallet();
+      const walletSolBeforeDeploy = await getNativeSolBalance().catch(() => null);
       log(
         "deploy",
         `Relay deploy via Agent Meridian: ${pool_address} activeBin ${activeBin.binId} bins ${minBinId}->${maxBinId} amountY=${finalAmountY}`,
@@ -866,6 +897,7 @@ export async function deployPosition({
 
       await new Promise((resolve) => setTimeout(resolve, 5000));
       _positionsCacheAt = 0;
+      const walletSolAfterDeploy = await getNativeSolBalance().catch(() => null);
       const refreshed = await getMyPositions({ force: true, silent: true }).catch(() => null);
       const matching = refreshed?.positions?.find(
         (position) => position.pool === pool_address && position.lower_bin === minBinId && position.upper_bin === maxBinId,
@@ -895,6 +927,8 @@ export async function deployPosition({
           entry_tvl,
           entry_volume,
           entry_holders,
+          wallet_sol_before_deploy: walletSolBeforeDeploy,
+          wallet_sol_after_deploy: walletSolAfterDeploy,
         });
       }
 
@@ -912,6 +946,8 @@ export async function deployPosition({
         ].filter(Boolean),
         metrics: {
           amount_sol: finalAmountY,
+          wallet_sol_before_deploy: walletSolBeforeDeploy,
+          wallet_sol_after_deploy: walletSolAfterDeploy,
           strategy: activeStrategy,
           active_bin: activeBin.binId,
           min_bin: minBinId,
@@ -942,6 +978,11 @@ export async function deployPosition({
         wide_range: isWideRange,
         amount_x: finalAmountX,
         amount_y: finalAmountY,
+        wallet_sol_before_deploy: walletSolBeforeDeploy,
+        wallet_sol_after_deploy: walletSolAfterDeploy,
+        wallet_sol_deploy_delta: walletSolBeforeDeploy != null && walletSolAfterDeploy != null
+          ? roundSolAmount(walletSolAfterDeploy - walletSolBeforeDeploy)
+          : null,
         txs: normalizeExecutionSignatures(submit),
       };
     } catch (error) {
@@ -951,6 +992,7 @@ export async function deployPosition({
   }
 
   const wallet = getWallet();
+  const walletSolBeforeDeploy = await getNativeSolBalance().catch(() => null);
   const newPosition = Keypair.generate();
 
   log("deploy", `Pool: ${pool_address}`);
@@ -1060,6 +1102,7 @@ export async function deployPosition({
     log("deploy", `SUCCESS — ${txHashes.length} tx(s): ${txHashes[0]}`);
 
     _positionsCacheAt = 0;
+    const walletSolAfterDeploy = await getNativeSolBalance().catch(() => null);
     const signalSnapshot = config.darwin?.enabled
       ? getAndClearStagedSignals(pool_address, baseMint)
       : null;
@@ -1083,6 +1126,8 @@ export async function deployPosition({
       entry_tvl,
       entry_volume,
       entry_holders,
+      wallet_sol_before_deploy: walletSolBeforeDeploy,
+      wallet_sol_after_deploy: walletSolAfterDeploy,
       notes: initialNotes,
     });
 
@@ -1102,6 +1147,11 @@ export async function deployPosition({
       ].filter(Boolean),
       metrics: {
         amount_sol: finalAmountY,
+        wallet_sol_before_deploy: walletSolBeforeDeploy,
+        wallet_sol_after_deploy: walletSolAfterDeploy,
+        wallet_sol_deploy_delta: walletSolBeforeDeploy != null && walletSolAfterDeploy != null
+          ? roundSolAmount(walletSolAfterDeploy - walletSolBeforeDeploy)
+          : null,
         strategy: effectiveStrategy,
         layers: executedLayers,
         active_bin: activeBin.binId,
@@ -1133,6 +1183,11 @@ export async function deployPosition({
       wide_range: isWideRange,
       amount_x: finalAmountX,
       amount_y: finalAmountY,
+      wallet_sol_before_deploy: walletSolBeforeDeploy,
+      wallet_sol_after_deploy: walletSolAfterDeploy,
+      wallet_sol_deploy_delta: walletSolBeforeDeploy != null && walletSolAfterDeploy != null
+        ? roundSolAmount(walletSolAfterDeploy - walletSolBeforeDeploy)
+        : null,
       txs: txHashes,
     };
   } catch (error) {
@@ -1802,6 +1857,7 @@ export async function closePosition({ position_address, reason }) {
   try {
     log("close", `Closing position: ${position_address}`);
     const wallet = getWallet();
+    const walletSolBeforeClose = await getNativeSolBalance().catch(() => null);
     const poolAddress = await lookupPoolForPosition(position_address, wallet.publicKey.toString());
     const poolMeta = await getPoolMetadata(poolAddress);
     if (shouldUseLpAgentRelay()) {
@@ -1905,6 +1961,7 @@ export async function closePosition({ position_address, reason }) {
       }
 
       recordClose(position_address, reason || "agent decision");
+      const walletSolAfterClose = await getNativeSolBalance().catch(() => null);
 
       if (tracked) {
         const deployedAt = new Date(tracked.deployed_at).getTime();
@@ -1920,6 +1977,10 @@ export async function closePosition({ position_address, reason }) {
         let finalValueUsd = 0;
         let initialUsd = 0;
         let feesUsd = tracked.total_fees_claimed_usd || 0;
+        let pnlSol = null;
+        let finalValueSol = null;
+        let initialSol = tracked.amount_sol ?? null;
+        let feesSol = 0;
         try {
           const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=closed&pageSize=50&page=1`;
           for (let attempt = 0; attempt < 6; attempt++) {
@@ -1934,6 +1995,10 @@ export async function closePosition({ position_address, reason }) {
                 finalValueUsd = parseFloat(posEntry.allTimeWithdrawals?.total?.usd || 0);
                 initialUsd = parseFloat(posEntry.allTimeDeposits?.total?.usd || 0);
                 feesUsd = parseFloat(posEntry.allTimeFees?.total?.usd || 0) || feesUsd;
+                pnlSol = getClosedPnlValue(posEntry, true);
+                finalValueSol = safeNum(posEntry.allTimeWithdrawals?.total?.sol);
+                initialSol = safeNum(posEntry.allTimeDeposits?.total?.sol) || initialSol;
+                feesSol = safeNum(posEntry.allTimeFees?.total?.sol);
                 break;
               }
             }
@@ -1948,6 +2013,25 @@ export async function closePosition({ position_address, reason }) {
           poolAddress,
           baseMint: closeBaseMint,
           tracked,
+        });
+        const solFields = deriveSolPnlFields({
+          tracked,
+          initialSol,
+          withdrawnSol: finalValueSol,
+          feesSol,
+          pnlSol,
+        });
+        const walletSolRoundtripDelta = tracked.wallet_sol_before_deploy != null && walletSolAfterClose != null
+          ? roundSolAmount(walletSolAfterClose - tracked.wallet_sol_before_deploy)
+          : null;
+        recordCloseSolMetrics(position_address, {
+          ...solFields,
+          wallet_sol_before_close: walletSolBeforeClose,
+          wallet_sol_after_close: walletSolAfterClose,
+          wallet_sol_close_delta: walletSolBeforeClose != null && walletSolAfterClose != null
+            ? roundSolAmount(walletSolAfterClose - walletSolBeforeClose)
+            : null,
+          wallet_sol_roundtrip_delta: walletSolRoundtripDelta,
         });
 
         let exitMarket = {};
@@ -1977,6 +2061,18 @@ export async function closePosition({ position_address, reason }) {
           organic_score: tracked.organic_score || null,
           amount_sol: tracked.amount_sol,
           fees_earned_usd: feesUsd,
+          fees_earned_sol: solFields.position_sol_fees,
+          position_sol_deployed: solFields.position_sol_deployed,
+          position_sol_withdrawn: solFields.position_sol_withdrawn,
+          position_sol_fees: solFields.position_sol_fees,
+          position_sol_final: solFields.position_sol_final,
+          position_sol_pnl: solFields.position_sol_pnl,
+          position_sol_pnl_pct: solFields.position_sol_pnl_pct,
+          wallet_sol_before_deploy: tracked.wallet_sol_before_deploy ?? null,
+          wallet_sol_after_deploy: tracked.wallet_sol_after_deploy ?? null,
+          wallet_sol_before_close: walletSolBeforeClose,
+          wallet_sol_after_close: walletSolAfterClose,
+          wallet_sol_roundtrip_delta: walletSolRoundtripDelta,
           final_value_usd: finalValueUsd,
           initial_value_usd: initialUsd,
           minutes_in_range: minutesHeld - minutesOOR,
@@ -2004,8 +2100,13 @@ export async function closePosition({ position_address, reason }) {
           ].filter(Boolean),
           metrics: {
             pnl_usd: pnlUsd,
+            pnl_sol: solFields.position_sol_pnl,
             pnl_pct: pnlPct,
             fees_usd: feesUsd,
+            fees_sol: solFields.position_sol_fees,
+            wallet_sol_before_deploy: tracked.wallet_sol_before_deploy ?? null,
+            wallet_sol_after_close: walletSolAfterClose,
+            wallet_sol_roundtrip_delta: walletSolRoundtripDelta,
             minutes_held: minutesHeld,
           },
         });
@@ -2022,6 +2123,16 @@ export async function closePosition({ position_address, reason }) {
           txs: txHashes,
           pnl_usd: pnlUsd,
           pnl_pct: pnlPct,
+          pnl_sol: solFields.position_sol_pnl,
+          position_sol_deployed: solFields.position_sol_deployed,
+          position_sol_final: solFields.position_sol_final,
+          position_sol_pnl: solFields.position_sol_pnl,
+          position_sol_pnl_pct: solFields.position_sol_pnl_pct,
+          wallet_sol_before_deploy: tracked.wallet_sol_before_deploy ?? null,
+          wallet_sol_after_deploy: tracked.wallet_sol_after_deploy ?? null,
+          wallet_sol_before_close: walletSolBeforeClose,
+          wallet_sol_after_close: walletSolAfterClose,
+          wallet_sol_roundtrip_delta: walletSolRoundtripDelta,
           base_mint: closeBaseMint,
         };
       }
@@ -2165,6 +2276,7 @@ export async function closePosition({ position_address, reason }) {
     }
 
     recordClose(position_address, reason || "agent decision");
+    const walletSolAfterClose = await getNativeSolBalance().catch(() => null);
 
     // Record performance for learning
     if (tracked) {
@@ -2192,6 +2304,10 @@ export async function closePosition({ position_address, reason }) {
       let finalValueUsd = 0;
       let initialUsd = 0;
       let feesUsd = tracked.total_fees_claimed_usd || 0;
+      let pnlSol = null;
+      let finalValueSol = null;
+      let initialSol = tracked.amount_sol ?? null;
+      let feesSol = 0;
       try {
         const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=closed&pageSize=50&page=1`;
         for (let attempt = 0; attempt < 6; attempt++) {
@@ -2206,6 +2322,10 @@ export async function closePosition({ position_address, reason }) {
               const nextFinalValueUsd = parseFloat(posEntry.allTimeWithdrawals?.total?.usd || 0);
               const nextInitialUsd = parseFloat(posEntry.allTimeDeposits?.total?.usd || 0);
               const nextFeesUsd = parseFloat(posEntry.allTimeFees?.total?.usd || 0) || feesUsd;
+              const nextPnlSol = getClosedPnlValue(posEntry, true);
+              const nextFinalValueSol = safeNum(posEntry.allTimeWithdrawals?.total?.sol);
+              const nextInitialSol = safeNum(posEntry.allTimeDeposits?.total?.sol) || initialSol;
+              const nextFeesSol = safeNum(posEntry.allTimeFees?.total?.sol);
 
               if (shouldRejectClosedPnl(nextPnlPct, reason || tracked?.close_reason)) {
                 log("close_warn", `Rejected unsettled closed PnL for ${position_address.slice(0, 8)} on attempt ${attempt + 1}/6: ${nextPnlPct.toFixed(2)}%`);
@@ -2216,6 +2336,10 @@ export async function closePosition({ position_address, reason }) {
                 finalValueUsd = nextFinalValueUsd;
                 initialUsd    = nextInitialUsd;
                 feesUsd       = nextFeesUsd;
+                pnlSol        = nextPnlSol;
+                finalValueSol = nextFinalValueSol;
+                initialSol    = nextInitialSol;
+                feesSol       = nextFeesSol;
                 log("close", `Closed PnL from API: pnl=${pnlUsd.toFixed(2)} ${config.management.solMode ? "SOL" : "USD"} (${pnlPct.toFixed(2)}%), withdrawn=${finalValueUsd.toFixed(2)} USD, deposited=${initialUsd.toFixed(2)} USD`);
                 break;
               }
@@ -2245,6 +2369,14 @@ export async function closePosition({ position_address, reason }) {
             finalValueUsd = cachedPos.total_value_true_usd ?? cachedPos.total_value_usd ?? 0;
             initialUsd = Math.max(0, finalValueUsd + feesUsd - pnlTrueUsd);
           }
+          if (config.management.solMode) {
+            initialSol = tracked.amount_sol ?? initialSol;
+            pnlSol = cachedPos.pnl_usd ?? null;
+            feesSol = (cachedPos.collected_fees_usd || 0) + (cachedPos.unclaimed_fees_usd || 0);
+            finalValueSol = initialSol != null && pnlSol != null
+              ? Math.max(0, initialSol + pnlSol - feesSol)
+              : cachedPos.total_value_usd ?? null;
+          }
           log("close_warn", `Using cached pnl fallback because closed API has not settled yet`);
         }
       }
@@ -2254,6 +2386,25 @@ export async function closePosition({ position_address, reason }) {
         poolAddress,
         baseMint: closeBaseMint,
         tracked,
+      });
+      const solFields = deriveSolPnlFields({
+        tracked,
+        initialSol,
+        withdrawnSol: finalValueSol,
+        feesSol,
+        pnlSol,
+      });
+      const walletSolRoundtripDelta = tracked.wallet_sol_before_deploy != null && walletSolAfterClose != null
+        ? roundSolAmount(walletSolAfterClose - tracked.wallet_sol_before_deploy)
+        : null;
+      recordCloseSolMetrics(position_address, {
+        ...solFields,
+        wallet_sol_before_close: walletSolBeforeClose,
+        wallet_sol_after_close: walletSolAfterClose,
+        wallet_sol_close_delta: walletSolBeforeClose != null && walletSolAfterClose != null
+          ? roundSolAmount(walletSolAfterClose - walletSolBeforeClose)
+          : null,
+        wallet_sol_roundtrip_delta: walletSolRoundtripDelta,
       });
 
       let exitMarket = {};
@@ -2282,6 +2433,18 @@ export async function closePosition({ position_address, reason }) {
         organic_score: tracked.organic_score || null,
         amount_sol: tracked.amount_sol,
         fees_earned_usd: feesUsd,
+        fees_earned_sol: solFields.position_sol_fees,
+        position_sol_deployed: solFields.position_sol_deployed,
+        position_sol_withdrawn: solFields.position_sol_withdrawn,
+        position_sol_fees: solFields.position_sol_fees,
+        position_sol_final: solFields.position_sol_final,
+        position_sol_pnl: solFields.position_sol_pnl,
+        position_sol_pnl_pct: solFields.position_sol_pnl_pct,
+        wallet_sol_before_deploy: tracked.wallet_sol_before_deploy ?? null,
+        wallet_sol_after_deploy: tracked.wallet_sol_after_deploy ?? null,
+        wallet_sol_before_close: walletSolBeforeClose,
+        wallet_sol_after_close: walletSolAfterClose,
+        wallet_sol_roundtrip_delta: walletSolRoundtripDelta,
         final_value_usd: finalValueUsd,
         initial_value_usd: initialUsd,
         minutes_in_range: minutesHeld - minutesOOR,
@@ -2309,8 +2472,13 @@ export async function closePosition({ position_address, reason }) {
         ].filter(Boolean),
         metrics: {
           pnl_usd: pnlUsd,
+          pnl_sol: solFields.position_sol_pnl,
           pnl_pct: pnlPct,
           fees_usd: feesUsd,
+          fees_sol: solFields.position_sol_fees,
+          wallet_sol_before_deploy: tracked.wallet_sol_before_deploy ?? null,
+          wallet_sol_after_close: walletSolAfterClose,
+          wallet_sol_roundtrip_delta: walletSolRoundtripDelta,
           minutes_held: minutesHeld,
         },
       });
@@ -2325,6 +2493,16 @@ export async function closePosition({ position_address, reason }) {
         txs: txHashes,
         pnl_usd: pnlUsd,
         pnl_pct: pnlPct,
+        pnl_sol: solFields.position_sol_pnl,
+        position_sol_deployed: solFields.position_sol_deployed,
+        position_sol_final: solFields.position_sol_final,
+        position_sol_pnl: solFields.position_sol_pnl,
+        position_sol_pnl_pct: solFields.position_sol_pnl_pct,
+        wallet_sol_before_deploy: tracked.wallet_sol_before_deploy ?? null,
+        wallet_sol_after_deploy: tracked.wallet_sol_after_deploy ?? null,
+        wallet_sol_before_close: walletSolBeforeClose,
+        wallet_sol_after_close: walletSolAfterClose,
+        wallet_sol_roundtrip_delta: walletSolRoundtripDelta,
         close_reason: reason || "agent decision",
         base_mint: closeBaseMint,
       };

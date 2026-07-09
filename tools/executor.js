@@ -7,12 +7,13 @@ import {
   getPositionPnl,
   claimFees,
   closePosition,
+  getNativeSolBalance,
   searchPools,
 } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction } from "../state.js";
+import { recordCloseSolMetrics, setPositionInstruction } from "../state.js";
 
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
@@ -773,12 +774,6 @@ export async function executeTool(name, args) {
       } else if (name === "deploy_position") {
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
       } else if (name === "close_position") {
-        notifyClose({
-        pair: result.pool_name || args.position_address?.slice(0, 8),
-        pnlUsd: result.pnl_usd ?? 0,
-        pnlPct: result.pnl_pct ?? 0,
-        reason: result.close_reason || args.reason,
-      }).catch(() => {});
         // Note low-yield closes in pool memory so screener avoids redeploying
         if (args.reason && args.reason.toLowerCase().includes("yield")) {
           const poolAddr = result.pool || args.pool_address;
@@ -794,6 +789,35 @@ export async function executeTool(name, args) {
             if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
           }
         }
+        const walletSolAfterAutoSwap = await getNativeSolBalance().catch(() => null);
+        if (walletSolAfterAutoSwap != null) {
+          result.wallet_sol_after_autoswap = walletSolAfterAutoSwap;
+          if (result.wallet_sol_before_deploy != null) {
+            result.wallet_sol_roundtrip_delta_after_autoswap = Number((walletSolAfterAutoSwap - result.wallet_sol_before_deploy).toFixed(9));
+          }
+          if (result.wallet_sol_before_close != null) {
+            result.wallet_sol_close_delta_after_autoswap = Number((walletSolAfterAutoSwap - result.wallet_sol_before_close).toFixed(9));
+          }
+          if (result.position) {
+            recordCloseSolMetrics(result.position, {
+              wallet_sol_after_autoswap: walletSolAfterAutoSwap,
+              wallet_sol_roundtrip_delta_after_autoswap: result.wallet_sol_roundtrip_delta_after_autoswap ?? null,
+              wallet_sol_close_delta_after_autoswap: result.wallet_sol_close_delta_after_autoswap ?? null,
+            });
+          }
+        }
+        notifyClose({
+          pair: result.pool_name || args.position_address?.slice(0, 8),
+          pnlUsd: result.pnl_usd ?? 0,
+          pnlPct: result.pnl_pct ?? 0,
+          pnlSol: result.position_sol_pnl ?? result.pnl_sol,
+          positionSolDeployed: result.position_sol_deployed,
+          positionSolFinal: result.position_sol_final,
+          walletSolBeforeDeploy: result.wallet_sol_before_deploy,
+          walletSolAfterClose: result.wallet_sol_after_autoswap ?? result.wallet_sol_after_close,
+          walletSolRoundtripDelta: result.wallet_sol_roundtrip_delta_after_autoswap ?? result.wallet_sol_roundtrip_delta,
+          reason: result.close_reason || args.reason,
+        }).catch(() => {});
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
         await swapBaseToSolWithRetry(result.base_mint, "after claim");
       }

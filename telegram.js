@@ -504,13 +504,49 @@ function escapeHTML(value) {
     .replace(/>/g, "&gt;");
 }
 
-export async function notifyClose({ pair, pnlUsd, pnlPct, reason }) {
+function fmtSol(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toFixed(6) : null;
+}
+
+export async function notifyClose({
+  pair,
+  pnlUsd,
+  pnlPct,
+  pnlSol,
+  positionSolDeployed,
+  positionSolFinal,
+  walletSolBeforeDeploy,
+  walletSolAfterClose,
+  walletSolRoundtripDelta,
+  reason,
+}) {
   if (hasActiveLiveMessage()) return;
   const sign = pnlUsd >= 0 ? "+" : "";
+  const solPnl = fmtSol(pnlSol);
+  const solSign = Number(pnlSol) >= 0 ? "+" : "";
+  const positionLine = solPnl != null
+    ? `SOL PnL: ${solSign}◎${solPnl}${pnlPct != null ? ` (${solSign}${(pnlPct ?? 0).toFixed(2)}%)` : ""}\n`
+    : "";
+  const deployed = fmtSol(positionSolDeployed);
+  const final = fmtSol(positionSolFinal);
+  const positionDetailLine = deployed != null && final != null
+    ? `Position SOL: ◎${deployed} → ◎${final}\n`
+    : "";
+  const walletBefore = fmtSol(walletSolBeforeDeploy);
+  const walletAfter = fmtSol(walletSolAfterClose);
+  const walletDelta = fmtSol(walletSolRoundtripDelta);
+  const walletSign = Number(walletSolRoundtripDelta) >= 0 ? "+" : "";
+  const walletLine = walletBefore != null && walletAfter != null
+    ? `Wallet SOL: ◎${walletBefore} → ◎${walletAfter}${walletDelta != null ? ` (${walletSign}◎${walletDelta})` : ""}\n`
+    : "";
   const reasonLine = reason ? `Reason: ${escapeHTML(reason)}\n` : "";
   await sendHTML(
     `🔒 <b>Closed</b> ${escapeHTML(pair)}\n` +
     reasonLine +
+    positionLine +
+    positionDetailLine +
+    walletLine +
     `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
   );
 }

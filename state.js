@@ -74,6 +74,8 @@ export function trackPosition({
   entry_tvl = null,
   entry_volume = null,
   entry_holders = null,
+  wallet_sol_before_deploy = null,
+  wallet_sol_after_deploy = null,
   notes = [],
 }) {
   const state = load();
@@ -97,6 +99,11 @@ export function trackPosition({
     entry_tvl,
     entry_volume,
     entry_holders,
+    wallet_sol_before_deploy,
+    wallet_sol_after_deploy,
+    wallet_sol_deploy_delta: wallet_sol_before_deploy != null && wallet_sol_after_deploy != null
+      ? Number((wallet_sol_after_deploy - wallet_sol_before_deploy).toFixed(9))
+      : null,
     signal_snapshot: signal_snapshot || null,
     deployed_at: new Date().toISOString(),
     out_of_range_since: null,
@@ -264,6 +271,18 @@ export function recordClose(position_address, reason) {
   pushEvent(state, { action: "close", position: position_address, pool_name: pos.pool_name || pos.pool, reason });
   save(state);
   log("state", `Position ${position_address} marked closed: ${reason}`);
+}
+
+export function recordCloseSolMetrics(position_address, metrics = {}) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos) return false;
+  for (const [key, value] of Object.entries(metrics)) {
+    if (value !== undefined) pos[key] = value;
+  }
+  save(state);
+  log("state", `Position ${position_address} SOL metrics updated`);
+  return true;
 }
 
 /**
