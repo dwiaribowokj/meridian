@@ -169,6 +169,9 @@ function getRawPoolScreeningRejectReason(pool, s) {
   if (!isUsableVolatility(volatility)) {
     return `volatility ${volatility ?? "unknown"} is unusable`;
   }
+  if (s.maxVolatility != null && volatility > s.maxVolatility) {
+    return `volatility ${volatility} above maxVolatility ${s.maxVolatility}`;
+  }
   if (baseOrganic == null || baseOrganic < s.minOrganic) {
     return `base organic ${baseOrganic ?? "unknown"} below minOrganic ${s.minOrganic}`;
   }
@@ -715,6 +718,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const minTvl = Number(config.screening.minTvl ?? 0);
   const maxTvl = config.screening.maxTvl == null ? null : Number(config.screening.maxTvl);
   const minFeeActiveTvlRatio = Number(config.screening.minFeeActiveTvlRatio ?? 0);
+  const maxVolatility = config.screening.maxVolatility == null ? null : Number(config.screening.maxVolatility);
 
   const eligible = pools
     .filter((p) => {
@@ -734,6 +738,11 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       }
       if (!isUsableVolatility(p.volatility)) {
         pushFilteredReason(filteredOut, p, `volatility ${p.volatility ?? "unknown"} is unusable`);
+        return false;
+      }
+      const volatility = Number(p.volatility);
+      if (Number.isFinite(maxVolatility) && maxVolatility > 0 && volatility > maxVolatility) {
+        pushFilteredReason(filteredOut, p, `volatility ${volatility} above maxVolatility ${maxVolatility}`);
         return false;
       }
       if (occupiedPools.has(p.pool)) {

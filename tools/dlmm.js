@@ -1259,6 +1259,44 @@ function roundNum(value, decimals = 4) {
   return Math.round(n * factor) / factor;
 }
 
+function pnlOutlierReason({ pnlPct, derivedPnlPct, pnlPctDiff, ageMinutes }) {
+  if (!Number.isFinite(pnlPct)) return null;
+  const absPnl = Math.abs(pnlPct);
+  const newPositionMinutes = Number(config.management.pnlNewPositionOutlierMinutes ?? 3);
+  const newPositionMaxPct = Number(config.management.pnlNewPositionOutlierMaxPct ?? 5);
+  const outlierMaxPct = Number(config.management.pnlOutlierMaxPct ?? 20);
+  const maxDiffPct = Number(config.management.pnlSanityMaxDiffPct ?? 5);
+  const divergenceMinPct = Number(config.management.pnlDivergenceGateMinPct ?? 3);
+
+  if (
+    Number.isFinite(ageMinutes) &&
+    Number.isFinite(newPositionMinutes) &&
+    Number.isFinite(newPositionMaxPct) &&
+    ageMinutes < newPositionMinutes &&
+    absPnl >= newPositionMaxPct
+  ) {
+    return `new-position outlier ${pnlPct.toFixed(2)}% at ${ageMinutes}m`;
+  }
+  if (
+    Number.isFinite(outlierMaxPct) &&
+    Number.isFinite(maxDiffPct) &&
+    absPnl >= outlierMaxPct &&
+    (derivedPnlPct == null || pnlPctDiff == null || pnlPctDiff > maxDiffPct)
+  ) {
+    return `absolute outlier ${pnlPct.toFixed(2)}%`;
+  }
+  if (
+    Number.isFinite(maxDiffPct) &&
+    Number.isFinite(divergenceMinPct) &&
+    pnlPctDiff != null &&
+    pnlPctDiff > maxDiffPct &&
+    absPnl >= divergenceMinPct
+  ) {
+    return `reported/derived divergence ${pnlPctDiff.toFixed(2)}%`;
+  }
+  return null;
+}
+
 const PERFORMANCE_SIGNAL_FIELDS = [
   "organic_score",
   "fee_tvl_ratio",
@@ -1475,13 +1513,16 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
         const pnlPctDiff = reportedPnlPct != null && derivedPnlPct != null
           ? Math.abs(reportedPnlPct - derivedPnlPct)
           : null;
-        // Gate PnL rules ONLY when the tick is genuinely unpriceable (no real number
-        // from either method — e.g. missing deposits / data outage). Reported-vs-derived
-        // divergence is normal noise on volatile pools, so it is logged but NOT gated —
-        // gating on it froze all exits (stop-loss/trailing/close) and stranded positions.
-        const pnlPctSuspicious = reportedPnlPct == null && derivedPnlPct == null;
+        const selectedPnlPct = reportedPnlPct ?? derivedPnlPct;
+        const outlierReason = pnlOutlierReason({
+          pnlPct: selectedPnlPct,
+          derivedPnlPct,
+          pnlPctDiff,
+          ageMinutes: ageFromState,
+        });
+        const pnlPctSuspicious = (reportedPnlPct == null && derivedPnlPct == null) || !!outlierReason;
         if (pnlPctSuspicious) {
-          log("positions_warn", `Unpriceable pnl_pct for ${positionAddress.slice(0, 8)}: no valid reported/derived value this tick — PnL rules paused`);
+          log("positions_warn", `Suspicious pnl_pct for ${positionAddress.slice(0, 8)}: reported=${reportedPnlPct != null ? reportedPnlPct.toFixed(2) : "n/a"} derived=${derivedPnlPct != null ? derivedPnlPct.toFixed(2) : "n/a"} reason=${outlierReason || "unpriceable"} — PnL rules paused`);
         } else if (pnlPctDiff != null && pnlPctDiff > (config.management.pnlSanityMaxDiffPct ?? 5)) {
           // Informational only — does not gate rules.
           log("positions_warn", `pnl_pct divergence for ${positionAddress.slice(0, 8)}: reported=${reportedPnlPct.toFixed(2)} derived=${derivedPnlPct.toFixed(2)} diff=${pnlPctDiff.toFixed(2)} (informational)`);
@@ -1556,8 +1597,8 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
             : binData
             ? Math.round(parseFloat(binData.pnlUsd || 0) * 10000) / 10000
             : null,
-          pnl_pct:            (lpData || binData)
-            ? Math.round(reportedPnlPct * 100) / 100
+          pnl_pct:            selectedPnlPct != null
+            ? Math.round(selectedPnlPct * 100) / 100
             : null,
           pnl_pct_derived:    derivedPnlPct != null ? Math.round(derivedPnlPct * 100) / 100 : null,
           pnl_pct_diff:       pnlPctDiff != null ? Math.round(pnlPctDiff * 100) / 100 : null,

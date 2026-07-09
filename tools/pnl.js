@@ -46,6 +46,47 @@ function maybeNum(value) {
   const n = parseFloat(value);
   return Number.isFinite(n) ? n : null;
 }
+function fallbackDepositSol(tracked) {
+  const amountSol = Number(tracked?.amount_sol);
+  return Number.isFinite(amountSol) && amountSol > 0 ? amountSol : 0;
+}
+function pnlOutlierReason({ pnlPct, reportedPct, pnlPctDiff, ageMinutes }) {
+  if (!Number.isFinite(pnlPct)) return null;
+  const absPnl = Math.abs(pnlPct);
+  const newPositionMinutes = Number(config.management.pnlNewPositionOutlierMinutes ?? 3);
+  const newPositionMaxPct = Number(config.management.pnlNewPositionOutlierMaxPct ?? 5);
+  const outlierMaxPct = Number(config.management.pnlOutlierMaxPct ?? 20);
+  const maxDiffPct = Number(config.management.pnlSanityMaxDiffPct ?? 5);
+  const divergenceMinPct = Number(config.management.pnlDivergenceGateMinPct ?? 3);
+
+  if (
+    Number.isFinite(ageMinutes) &&
+    Number.isFinite(newPositionMinutes) &&
+    Number.isFinite(newPositionMaxPct) &&
+    ageMinutes < newPositionMinutes &&
+    absPnl >= newPositionMaxPct
+  ) {
+    return `new-position outlier ${pnlPct.toFixed(2)}% at ${ageMinutes}m`;
+  }
+  if (
+    Number.isFinite(outlierMaxPct) &&
+    Number.isFinite(maxDiffPct) &&
+    absPnl >= outlierMaxPct &&
+    (reportedPct == null || pnlPctDiff == null || pnlPctDiff > maxDiffPct)
+  ) {
+    return `absolute outlier ${pnlPct.toFixed(2)}%`;
+  }
+  if (
+    Number.isFinite(maxDiffPct) &&
+    Number.isFinite(divergenceMinPct) &&
+    pnlPctDiff != null &&
+    pnlPctDiff > maxDiffPct &&
+    absPnl >= divergenceMinPct
+  ) {
+    return `reported/derived divergence ${pnlPctDiff.toFixed(2)}%`;
+  }
+  return null;
+}
 function round(value, decimals = 4) {
   const n = Number(value);
   if (!Number.isFinite(n)) return 0;
@@ -151,6 +192,7 @@ function mapEntries(map) {
 
 // ─── Build the shaped position object (matches getMyPositions output) ──
 function buildPosition(f, prices, solUsd, meteora, solMode) {
+  const tracked = getTrackedPosition(f.position);
   const priceX = f.baseMint ? (prices[f.baseMint] ?? 0) : 0;
 
   const xHuman = safeNum(f.xRaw) / 10 ** f.decX;
@@ -163,8 +205,12 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
   const claimableUsd = feeXHuman * priceX + feeYHuman * (solUsd ?? 0);
   const claimableSol = solUsd ? claimableUsd / solUsd : feeYHuman;
 
-  const depositsUsd = safeNum(meteora?.allTimeDeposits?.total?.usd);
-  const depositsSol = safeNum(meteora?.allTimeDeposits?.total?.sol);
+  const meteoraDepositsUsd = safeNum(meteora?.allTimeDeposits?.total?.usd);
+  const meteoraDepositsSol = safeNum(meteora?.allTimeDeposits?.total?.sol);
+  const fallbackDepositsSol = fallbackDepositSol(tracked);
+  const fallbackDepositsUsd = fallbackDepositsSol > 0 && solUsd > 0 ? fallbackDepositsSol * solUsd : 0;
+  const depositsUsd = meteoraDepositsUsd > 0 ? meteoraDepositsUsd : fallbackDepositsUsd;
+  const depositsSol = meteoraDepositsSol > 0 ? meteoraDepositsSol : fallbackDepositsSol;
   const withdrawUsd = safeNum(meteora?.allTimeWithdrawals?.total?.usd);
   const withdrawSol = safeNum(meteora?.allTimeWithdrawals?.total?.sol);
   const claimedUsd = safeNum(meteora?.allTimeFees?.total?.usd);
@@ -192,9 +238,19 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
   const holdsTokenX = xHuman > 0 || feeXHuman > 0;
   const priceMissing = !(solUsd > 0) || (holdsTokenX && !!f.baseMint && !(priceX > 0));
   const depositsMissing = (solMode ? depositsSol : depositsUsd) <= 0;
-  const pnlPctSuspicious = priceMissing || depositsMissing;
+  const ageFromState = tracked?.deployed_at
+    ? Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000)
+    : null;
+  const ageMinutes = meteora?.createdAt ? Math.floor((Date.now() - meteora.createdAt * 1000) / 60000) : ageFromState;
+  const outlierReason = pnlOutlierReason({
+    pnlPct: ourPct,
+    reportedPct,
+    pnlPctDiff,
+    ageMinutes,
+  });
+  const pnlPctSuspicious = priceMissing || depositsMissing || !!outlierReason;
   if (pnlPctSuspicious) {
-    log("pnl_warn", `${f.position.slice(0, 8)} suspicious tick — priceMissing=${priceMissing} depositsMissing=${depositsMissing} (solUsd=${solUsd}, priceX=${priceX})`);
+    log("pnl_warn", `${f.position.slice(0, 8)} suspicious tick — priceMissing=${priceMissing} depositsMissing=${depositsMissing} outlier=${outlierReason || false} (solUsd=${solUsd}, priceX=${priceX})`);
   }
 
   const inRange = f.active != null && f.lower != null && f.upper != null
@@ -203,12 +259,6 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
 
   if (inRange) markInRange(f.position);
   else markOutOfRange(f.position);
-
-  const tracked = getTrackedPosition(f.position);
-  const ageFromState = tracked?.deployed_at
-    ? Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000)
-    : null;
-  const ageMinutes = meteora?.createdAt ? Math.floor((Date.now() - meteora.createdAt * 1000) / 60000) : ageFromState;
 
   return {
     position:           f.position,
@@ -231,6 +281,7 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
     pnl_pct_derived:    round(ourPct, 2),
     pnl_pct_diff:       pnlPctDiff != null ? round(pnlPctDiff, 2) : null,
     pnl_pct_suspicious: !!pnlPctSuspicious,
+    pnl_cost_basis_source: meteoraDepositsUsd > 0 || meteoraDepositsSol > 0 ? "meteora" : (fallbackDepositsSol > 0 ? "state" : null),
     fee_per_tvl_24h:    meteora ? Math.round(safeNum(meteora.feePerTvl24h) * 100) / 100 : null,
     age_minutes:        ageMinutes,
     minutes_out_of_range: minutesOutOfRange(f.position),

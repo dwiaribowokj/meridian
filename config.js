@@ -106,6 +106,7 @@ export const config = {
     minTvl:            u.minTvl            ?? 10_000,
     maxTvl:            u.maxTvl !== undefined ? u.maxTvl : 150_000,
     minVolume:         u.minVolume         ?? 500,
+    maxVolatility:     u.maxVolatility     ?? null,
     minOrganic:        u.minOrganic        ?? 60,
     minQuoteOrganic:   u.minQuoteOrganic   ?? 60,
     minHolders:        u.minHolders        ?? 500,
@@ -184,6 +185,11 @@ export const config = {
     microProfitRetracePct:     u.microProfitRetracePct     ?? 45,
     microProfitMinCurrentPct:  u.microProfitMinCurrentPct  ?? 0.05,
     microProfitMinAgeMinutes:  u.microProfitMinAgeMinutes  ?? 8,
+    profitStallCloseEnabled:   u.profitStallCloseEnabled   ?? true,
+    profitStallMinPeakPct:     u.profitStallMinPeakPct     ?? 0.55,
+    profitStallMinCurrentPct:  u.profitStallMinCurrentPct  ?? 0.35,
+    profitStallMinutes:        u.profitStallMinutes        ?? 6,
+    profitStallMaxFeePerTvl24h: u.profitStallMaxFeePerTvl24h ?? u.minFeePerTvl24h ?? 3,
     peakDecayCloseEnabled:     u.peakDecayCloseEnabled     ?? true,
     peakDecayMinPeakPct:       u.peakDecayMinPeakPct       ?? 0.4,
     peakDecayMinDropPct:       u.peakDecayMinDropPct       ?? 0.25,
@@ -191,6 +197,10 @@ export const config = {
     peakDecayMinutes:          u.peakDecayMinutes          ?? 12,
     peakDecayMaxFeePerTvl24h:  u.peakDecayMaxFeePerTvl24h  ?? u.minFeePerTvl24h ?? 3,
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
+    pnlNewPositionOutlierMinutes: u.pnlNewPositionOutlierMinutes ?? 3,
+    pnlNewPositionOutlierMaxPct:  u.pnlNewPositionOutlierMaxPct  ?? 5,
+    pnlOutlierMaxPct:            u.pnlOutlierMaxPct            ?? 20,
+    pnlDivergenceGateMinPct:      u.pnlDivergenceGateMinPct      ?? 3,
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
   },
@@ -393,6 +403,7 @@ export function reloadScreeningThresholds() {
     if (fresh.minTvl         != null) s.minTvl         = fresh.minTvl;
     if (fresh.maxTvl         !== undefined) s.maxTvl   = fresh.maxTvl;
     if (fresh.minVolume      != null) s.minVolume      = fresh.minVolume;
+    if (fresh.maxVolatility  !== undefined) s.maxVolatility = fresh.maxVolatility;
     if (fresh.minBinStep     != null) s.minBinStep     = fresh.minBinStep;
     if (fresh.maxBinStep     != null) s.maxBinStep     = fresh.maxBinStep;
     if (fresh.timeframe         != null) s.timeframe         = fresh.timeframe;

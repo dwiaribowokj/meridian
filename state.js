@@ -638,6 +638,30 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
       }
     }
 
+    if (mgmtConfig.profitStallCloseEnabled !== false) {
+      const profitStallMinPeakPct = configNumber(mgmtConfig.profitStallMinPeakPct, 0.55);
+      const profitStallMinCurrentPct = configNumber(mgmtConfig.profitStallMinCurrentPct, 0.35);
+      const profitStallMinutes = configNumber(mgmtConfig.profitStallMinutes, 6);
+      const profitStallMaxFeePerTvl24h = configNumber(
+        mgmtConfig.profitStallMaxFeePerTvl24h,
+        configNumber(mgmtConfig.minFeePerTvl24h, 3),
+      );
+      const minutesSincePeak = minutesSinceIso(pos.peak_pnl_confirmed_at);
+      if (
+        peakPnlPct >= profitStallMinPeakPct &&
+        currentPnlPct >= profitStallMinCurrentPct &&
+        minutesSincePeak != null &&
+        minutesSincePeak >= profitStallMinutes &&
+        fee_per_tvl_24h != null &&
+        fee_per_tvl_24h <= profitStallMaxFeePerTvl24h
+      ) {
+        return {
+          action: "PROFIT_STALL_CLOSE",
+          reason: `Profit stall close: peak ${peakPnlPct.toFixed(2)}% has not improved for ${minutesSincePeak}m, current ${currentPnlPct.toFixed(2)}% >= ${profitStallMinCurrentPct}%, fee/TVL ${fee_per_tvl_24h.toFixed(2)}% <= ${profitStallMaxFeePerTvl24h}%`,
+        };
+      }
+    }
+
     const profitProtectTriggerPct = Number(mgmtConfig.profitProtectTriggerPct ?? 2.0);
     const profitProtectStopPct = Number(mgmtConfig.profitProtectStopPct ?? 1.0);
     if (peakPnlPct >= profitProtectTriggerPct && currentPnlPct <= profitProtectStopPct) {
