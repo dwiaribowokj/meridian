@@ -643,6 +643,12 @@ export async function deployPosition({
   const { StrategyType, getBinIdFromPrice, getPriceOfBinByBinId } = await getDLMM();
   const pool = await getPool(pool_address);
   const baseMint = pool.lbPair.tokenXMint.toString();
+  const quoteMint = pool.lbPair.tokenYMint.toString();
+  if (quoteMint !== config.tokens.SOL) {
+    throw new Error(
+      `Unsupported pool quote ${quoteMint}: this agent only supports single-side SOL deploys into TOKEN-SOL pools.`,
+    );
+  }
   if (isBaseMintOnCooldown(baseMint)) {
     log("deploy", `Base mint ${baseMint.slice(0, 8)} is on cooldown — skipping deploy for pool ${pool_address.slice(0, 8)}`);
     return { success: false, error: "Token on cooldown — recently closed out-of-range too many times. Try a different token." };

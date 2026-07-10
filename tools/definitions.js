@@ -135,6 +135,7 @@ PRIORITY ORDER for strategy and bins:
 
 HARD RULES:
 - Never use 'curve'.
+- Only deploy into pools whose quote/token_y is SOL. Reject USDC/USDT quote pools because this agent deposits SOL as amount_y.
 - Bin Step: Only deploy in pools with bin_step between 80 and 125.
 - Volatility must be positive. If volatility is 0, null, or missing, do not deploy.
 - Range must cover at least 35 total bins. Never deploy 1-bin/tiny ranges.

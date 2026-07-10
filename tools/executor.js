@@ -71,6 +71,11 @@ function poolDetailVolatility(pool) {
   return numberOrNull(pool?.volatility);
 }
 
+function isSolQuoteDetail(pool) {
+  const quote = pool?.token_y || {};
+  return quote?.address === config.tokens.SOL || String(quote?.symbol || "").toUpperCase() === "SOL";
+}
+
 async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.timeframe || "5m") {
   const encodedTimeframe = encodeURIComponent(timeframe);
   const filter = encodeURIComponent(`pool_address=${poolAddress}`);
@@ -96,6 +101,13 @@ async function validateDeployPoolThresholds(args) {
   const tvl = poolDetailTvl(detail);
   const minTvl = numberOrNull(config.screening.minTvl);
   const maxTvl = numberOrNull(config.screening.maxTvl);
+  if (!isSolQuoteDetail(detail)) {
+    const quote = detail?.token_y || {};
+    return {
+      pass: false,
+      reason: `Pool quote token is ${quote.symbol || quote.address || "unknown"}, not SOL. This agent only supports single-side SOL deploys into TOKEN-SOL pools.`,
+    };
+  }
   if (tvl == null) {
     return {
       pass: false,

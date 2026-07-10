@@ -125,6 +125,16 @@ function getPoolBaseMint(pool) {
     null;
 }
 
+function isSolToken(token = {}) {
+  return token?.address === config.tokens.SOL ||
+    token?.mint === config.tokens.SOL ||
+    String(token?.symbol || "").toUpperCase() === "SOL";
+}
+
+function isSolQuotePool(pool) {
+  return isSolToken(pool?.token_y) || isSolToken(pool?.quote);
+}
+
 function getVolatilityTimeframe(sourceTimeframe) {
   const source = String(sourceTimeframe || "").trim();
   const sourceMinutes = TIMEFRAME_MINUTES[source];
@@ -154,6 +164,7 @@ function getRawPoolScreeningRejectReason(pool, s) {
   if (pool?.quote_token_has_critical_warnings === true) return "quote token has critical warnings";
   if (pool?.base_token_has_high_single_ownership === true) return "base token has high single ownership";
   if (pool?.pool_type && pool.pool_type !== "dlmm") return `pool_type ${pool.pool_type} is not dlmm`;
+  if (!isSolQuotePool(pool)) return `quote token ${quote?.symbol || quote?.address || "unknown"} is not SOL`;
 
   if (mcap == null || mcap < s.minMcap) return `mcap ${mcap ?? "unknown"} below minMcap ${s.minMcap}`;
   if (mcap > s.maxMcap) return `mcap ${mcap} above maxMcap ${s.maxMcap}`;
@@ -262,10 +273,8 @@ function searchPoolToken(pool, side) {
 }
 
 function isSolSearchPool(pool) {
-  const solMint = config.tokens.SOL;
-  const x = searchPoolToken(pool, "x");
   const y = searchPoolToken(pool, "y");
-  return x.mint === solMint || y.mint === solMint || x.symbol === "SOL" || y.symbol === "SOL";
+  return y.mint === config.tokens.SOL || String(y.symbol || "").toUpperCase() === "SOL";
 }
 
 async function fetchExtraSearchPools(s) {

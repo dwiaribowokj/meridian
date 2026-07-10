@@ -675,6 +675,7 @@ ${candidateBlocks.join("\n\n")}
 STEPS:
 1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
 2. Pick the best candidate based on narrative quality, smart wallets, pool metrics, audit warnings, and indicator context. Indicator/candle context is advisory: strong metrics can override a weak signal, but do not deploy into clearly bearish or stale momentum. Treat HIGH_SINGLE_OWNERSHIP, high top10 concentration, and unconfirmed indicator context as serious negatives that require exceptional live fee/volume strength to override.
+   Reject any pool whose quote/token_y is not SOL; this bot deposits single-side SOL via amount_y and cannot deploy into USDC/USDT quote pools.
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
    bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
    pass deploy_position.volatility = the candidate volatility value.
