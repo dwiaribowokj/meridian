@@ -154,6 +154,7 @@ export function recordPoolDeploy(poolAddress, deployData) {
   const entry = db[poolAddress];
 
   const deploy = {
+    position: deployData.position || null,
     deployed_at: deployData.deployed_at || null,
     closed_at: deployData.closed_at || new Date().toISOString(),
     pnl_pct: deployData.pnl_pct ?? null,
@@ -172,6 +173,9 @@ export function recordPoolDeploy(poolAddress, deployData) {
     wallet_sol_before_close: deployData.wallet_sol_before_close ?? null,
     wallet_sol_after_close: deployData.wallet_sol_after_close ?? null,
     wallet_sol_roundtrip_delta: deployData.wallet_sol_roundtrip_delta ?? null,
+    wallet_sol_after_autoswap: deployData.wallet_sol_after_autoswap ?? null,
+    wallet_sol_roundtrip_delta_after_autoswap: deployData.wallet_sol_roundtrip_delta_after_autoswap ?? null,
+    wallet_sol_close_delta_after_autoswap: deployData.wallet_sol_close_delta_after_autoswap ?? null,
     fee_earned_pct: deployData.fee_earned_pct ?? null,
     range_efficiency: deployData.range_efficiency ?? null,
     minutes_held: deployData.minutes_held ?? null,
@@ -276,6 +280,22 @@ export function recordPoolDeploy(poolAddress, deployData) {
 
   save(db);
   log("pool-memory", `Recorded deploy for ${entry.name} (${poolAddress.slice(0, 8)}): PnL ${deploy.pnl_pct}%`);
+}
+
+export function updatePoolDeploySolMetrics(poolAddress, position, metrics = {}) {
+  if (!poolAddress || !position) return false;
+  const db = load();
+  const entry = db[poolAddress];
+  if (!entry?.deploys?.length) return false;
+  const deploy = [...entry.deploys].reverse().find((item) => item.position === position);
+  if (!deploy) return false;
+
+  for (const [key, value] of Object.entries(metrics)) {
+    if (value !== undefined) deploy[key] = value;
+  }
+  save(db);
+  log("pool-memory", `Updated final SOL metrics for ${entry.name} (${position.slice(0, 8)})`);
+  return true;
 }
 
 export function isPoolOnCooldown(poolAddress) {

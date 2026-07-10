@@ -159,6 +159,8 @@ export const config = {
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
     deadPositionCheck1Minutes: u.deadPositionCheck1Minutes ?? 90,
     deadPositionCheck1MaxPeakPct: u.deadPositionCheck1MaxPeakPct ?? 0.5,
+    deadPositionCheck1MaxCurrentPct: u.deadPositionCheck1MaxCurrentPct ?? u.deadPositionCheck1MaxPeakPct ?? 0.5,
+    deadPositionCheck1MaxFeePerTvl24h: u.deadPositionCheck1MaxFeePerTvl24h ?? u.minFeePerTvl24h ?? 3,
     deadPositionCheck2Minutes: u.deadPositionCheck2Minutes ?? 120,
     deadPositionCheck2MaxPeakPct: u.deadPositionCheck2MaxPeakPct ?? 0.8,
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
@@ -197,7 +199,7 @@ export const config = {
     peakDecayMinutes:          u.peakDecayMinutes          ?? 12,
     peakDecayMaxFeePerTvl24h:  u.peakDecayMaxFeePerTvl24h  ?? u.minFeePerTvl24h ?? 3,
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
-    pnlNewPositionOutlierMinutes: u.pnlNewPositionOutlierMinutes ?? 3,
+    pnlNewPositionOutlierMinutes: u.pnlNewPositionOutlierMinutes ?? 10,
     pnlNewPositionOutlierMaxPct:  u.pnlNewPositionOutlierMaxPct  ?? 5,
     pnlOutlierMaxPct:            u.pnlOutlierMaxPct            ?? 20,
     pnlDivergenceGateMinPct:      u.pnlDivergenceGateMinPct      ?? 3,
@@ -222,6 +224,13 @@ export const config = {
     multiLayerSecondaryPct: Number(u.multiLayerSecondaryPct ?? 30),
     multiLayerMinLayerSol: Number(u.multiLayerMinLayerSol ?? u.multiLayerMinSecondarySol ?? 0.05),
     multiLayerMinSecondarySol: Number(u.multiLayerMinSecondarySol ?? u.multiLayerMinLayerSol ?? 0.05),
+    multiLayerMinDeploySol: Number(u.multiLayerMinDeploySol ?? 0.3),
+    regimeStrategyEnabled: u.regimeStrategyEnabled ?? false,
+    regimeLowVolMax: Number(u.regimeLowVolMax ?? 1),
+    regimeHighVolMin: Number(u.regimeHighVolMin ?? 2),
+    regimeLowVolStrategy: u.regimeLowVolStrategy ?? "spot",
+    regimeMidVolStrategy: u.regimeMidVolStrategy ?? u.strategy ?? "bid_ask",
+    regimeHighVolStrategy: u.regimeHighVolStrategy ?? "bid_ask",
   },
 
   // ─── Scheduling ─────────────────────────
@@ -444,5 +453,12 @@ export function reloadScreeningThresholds() {
     }
     if (fresh.multiLayerMinLayerSol != null) config.strategy.multiLayerMinLayerSol = Number(fresh.multiLayerMinLayerSol);
     if (fresh.multiLayerMinSecondarySol != null) config.strategy.multiLayerMinSecondarySol = Number(fresh.multiLayerMinSecondarySol);
+    if (fresh.multiLayerMinDeploySol != null) config.strategy.multiLayerMinDeploySol = Number(fresh.multiLayerMinDeploySol);
+    if (fresh.regimeStrategyEnabled !== undefined) config.strategy.regimeStrategyEnabled = fresh.regimeStrategyEnabled;
+    if (fresh.regimeLowVolMax != null) config.strategy.regimeLowVolMax = Number(fresh.regimeLowVolMax);
+    if (fresh.regimeHighVolMin != null) config.strategy.regimeHighVolMin = Number(fresh.regimeHighVolMin);
+    if (fresh.regimeLowVolStrategy != null) config.strategy.regimeLowVolStrategy = fresh.regimeLowVolStrategy;
+    if (fresh.regimeMidVolStrategy != null) config.strategy.regimeMidVolStrategy = fresh.regimeMidVolStrategy;
+    if (fresh.regimeHighVolStrategy != null) config.strategy.regimeHighVolStrategy = fresh.regimeHighVolStrategy;
   } catch { /* ignore */ }
 }

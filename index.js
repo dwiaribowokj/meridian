@@ -264,7 +264,7 @@ export async function runManagementCycle({ silent = false } = {}) {
   let mgmtReport = null;
   let positions = [];
   let liveMessage = null;
-  const screeningCooldownMs = 5 * 60 * 1000;
+  const screeningCooldownMs = Math.max(1, Number(config.schedule.screeningIntervalMin ?? 3)) * 60 * 1000;
 
   try {
     if (!silent && telegramEnabled()) {
@@ -285,6 +285,11 @@ export async function runManagementCycle({ silent = false } = {}) {
         log("cron", "No open positions — screening already running; management will not trigger another cycle");
         mgmtReport = "No open positions. Screening already running.";
         await liveMessage?.note("No open positions — screening already running.").catch(() => {});
+      } else if (Date.now() - _screeningLastTriggered < screeningCooldownMs) {
+        const secondsLeft = Math.ceil((screeningCooldownMs - (Date.now() - _screeningLastTriggered)) / 1000);
+        log("cron", `No open positions — screening cooldown active (${secondsLeft}s remaining)`);
+        mgmtReport = `No open positions. Screening cooldown active for ${secondsLeft}s.`;
+        await liveMessage?.note(mgmtReport).catch(() => {});
       } else {
         log("cron", "No open positions — management triggering screening cycle");
         mgmtReport = "No open positions. Management triggering screening cycle.";

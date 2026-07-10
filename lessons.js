@@ -114,9 +114,12 @@ export async function recordPerformance(perf) {
   }
 
   const pnl_usd = (perf.final_value_usd + perf.fees_earned_usd) - perf.initial_value_usd;
-  const pnl_pct = perf.initial_value_usd > 0
+  const apiPnlPct = perf.initial_value_usd > 0
     ? (pnl_usd / perf.initial_value_usd) * 100
     : 0;
+  const pnl_pct = Number.isFinite(perf.position_sol_pnl_pct)
+    ? Number(perf.position_sol_pnl_pct)
+    : apiPnlPct;
   const range_efficiency = perf.minutes_held > 0
     ? (perf.minutes_in_range / perf.minutes_held) * 100
     : 0;
@@ -138,6 +141,7 @@ export async function recordPerformance(perf) {
     ...perf,
     signal_snapshot: signalSnapshot,
     pnl_usd: Math.round(pnl_usd * 100) / 100,
+    api_pnl_pct: Math.round(apiPnlPct * 100) / 100,
     pnl_pct: Math.round(pnl_pct * 100) / 100,
     range_efficiency: Math.round(range_efficiency * 10) / 10,
     recorded_at: new Date().toISOString(),
@@ -162,6 +166,7 @@ export async function recordPerformance(perf) {
     const { recordPoolDeploy } = await import("./pool-memory.js");
     recordPoolDeploy(perf.pool, {
       pool_name: perf.pool_name,
+      position: perf.position,
       base_mint: perf.base_mint,
       deployed_at: perf.deployed_at,
       closed_at: entry.recorded_at,
@@ -183,6 +188,9 @@ export async function recordPerformance(perf) {
       wallet_sol_before_close: perf.wallet_sol_before_close ?? null,
       wallet_sol_after_close: perf.wallet_sol_after_close ?? null,
       wallet_sol_roundtrip_delta: perf.wallet_sol_roundtrip_delta ?? null,
+      wallet_sol_after_autoswap: perf.wallet_sol_after_autoswap ?? null,
+      wallet_sol_roundtrip_delta_after_autoswap: perf.wallet_sol_roundtrip_delta_after_autoswap ?? null,
+      wallet_sol_close_delta_after_autoswap: perf.wallet_sol_close_delta_after_autoswap ?? null,
       fee_earned_pct: perf.initial_value_usd > 0 ? ((perf.fees_earned_usd || 0) / perf.initial_value_usd) * 100 : null,
       close_reason: perf.close_reason,
       strategy: perf.strategy,
@@ -222,6 +230,25 @@ export async function recordPerformance(perf) {
     eventId: `close:${perf.position}:${entry.recorded_at}`,
   });
 
+}
+
+export async function updatePerformanceSolMetrics(position, metrics = {}) {
+  if (!position) return false;
+  const data = load();
+  const entry = [...data.performance].reverse().find((item) => item.position === position);
+  if (!entry) return false;
+
+  for (const [key, value] of Object.entries(metrics)) {
+    if (value !== undefined) entry[key] = value;
+  }
+  save(data);
+
+  if (entry.pool) {
+    const { updatePoolDeploySolMetrics } = await import("./pool-memory.js");
+    updatePoolDeploySolMetrics(entry.pool, position, metrics);
+  }
+  log("lessons", `Updated final SOL metrics for ${position.slice(0, 8)}`);
+  return true;
 }
 
 /**

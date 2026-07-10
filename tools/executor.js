@@ -14,6 +14,7 @@ import { getWalletBalances, swapToken } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { recordCloseSolMetrics, setPositionInstruction } from "../state.js";
+import { updatePerformanceSolMetrics } from "../lessons.js";
 
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
@@ -498,6 +499,10 @@ const toolMap = {
       gasReserve: ["management", "gasReserve"],
       positionSizePct: ["management", "positionSizePct"],
       minAgeBeforeYieldCheck: ["management", "minAgeBeforeYieldCheck"],
+      deadPositionCheck1Minutes: ["management", "deadPositionCheck1Minutes"],
+      deadPositionCheck1MaxPeakPct: ["management", "deadPositionCheck1MaxPeakPct"],
+      deadPositionCheck1MaxCurrentPct: ["management", "deadPositionCheck1MaxCurrentPct"],
+      deadPositionCheck1MaxFeePerTvl24h: ["management", "deadPositionCheck1MaxFeePerTvl24h"],
       // risk
       maxPositions: ["risk", "maxPositions"],
       maxDeployAmount: ["risk", "maxDeployAmount"],
@@ -527,6 +532,13 @@ const toolMap = {
       multiLayerSecondaryPct: ["strategy", "multiLayerSecondaryPct"],
       multiLayerMinLayerSol: ["strategy", "multiLayerMinLayerSol"],
       multiLayerMinSecondarySol: ["strategy", "multiLayerMinSecondarySol"],
+      multiLayerMinDeploySol: ["strategy", "multiLayerMinDeploySol"],
+      regimeStrategyEnabled: ["strategy", "regimeStrategyEnabled"],
+      regimeLowVolMax: ["strategy", "regimeLowVolMax"],
+      regimeHighVolMin: ["strategy", "regimeHighVolMin"],
+      regimeLowVolStrategy: ["strategy", "regimeLowVolStrategy"],
+      regimeMidVolStrategy: ["strategy", "regimeMidVolStrategy"],
+      regimeHighVolStrategy: ["strategy", "regimeHighVolStrategy"],
       // hivemind
       hiveMindUrl: ["hiveMind", "url"],
       hiveMindApiKey: ["hiveMind", "apiKey"],
@@ -811,10 +823,14 @@ export async function executeTool(name, args) {
             result.wallet_sol_close_delta_after_autoswap = Number((walletSolAfterAutoSwap - result.wallet_sol_before_close).toFixed(9));
           }
           if (result.position) {
-            recordCloseSolMetrics(result.position, {
+            const finalSolMetrics = {
               wallet_sol_after_autoswap: walletSolAfterAutoSwap,
               wallet_sol_roundtrip_delta_after_autoswap: result.wallet_sol_roundtrip_delta_after_autoswap ?? null,
               wallet_sol_close_delta_after_autoswap: result.wallet_sol_close_delta_after_autoswap ?? null,
+            };
+            recordCloseSolMetrics(result.position, finalSolMetrics);
+            await updatePerformanceSolMetrics(result.position, finalSolMetrics).catch((error) => {
+              log("lessons_warn", `Failed to persist final SOL metrics for ${result.position.slice(0, 8)}: ${error.message}`);
             });
           }
         }

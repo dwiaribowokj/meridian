@@ -749,10 +749,14 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     const peakPnlPct = pos.peak_pnl_pct ?? 0;
     const dead1Minutes = Number(mgmtConfig.deadPositionCheck1Minutes ?? 90);
     const dead1MaxPeakPct = Number(mgmtConfig.deadPositionCheck1MaxPeakPct ?? 0.5);
-    if (age_minutes >= dead1Minutes && peakPnlPct < dead1MaxPeakPct) {
+    const dead1MaxCurrentPct = Number(mgmtConfig.deadPositionCheck1MaxCurrentPct ?? dead1MaxPeakPct);
+    const dead1MaxFeePerTvl24h = Number(mgmtConfig.deadPositionCheck1MaxFeePerTvl24h ?? mgmtConfig.minFeePerTvl24h ?? 3);
+    const weakCurrentPnl = currentPnlPct <= dead1MaxCurrentPct;
+    const weakYield = fee_per_tvl_24h == null || fee_per_tvl_24h <= dead1MaxFeePerTvl24h;
+    if (age_minutes >= dead1Minutes && peakPnlPct < dead1MaxPeakPct && weakCurrentPnl && weakYield) {
       return {
         action: "DEAD_POSITION",
-        reason: `Dead position: age ${age_minutes}m >= ${dead1Minutes}m and peak ${peakPnlPct.toFixed(2)}% < ${dead1MaxPeakPct}%`,
+        reason: `Dead position: age ${age_minutes}m >= ${dead1Minutes}m, peak ${peakPnlPct.toFixed(2)}% < ${dead1MaxPeakPct}%, current ${currentPnlPct.toFixed(2)}% <= ${dead1MaxCurrentPct}%, fee/TVL ${fee_per_tvl_24h == null ? "n/a" : `${fee_per_tvl_24h.toFixed(2)}%`} <= ${dead1MaxFeePerTvl24h}%`,
       };
     }
 

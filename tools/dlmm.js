@@ -177,6 +177,10 @@ export function buildLayerPlan({
   const single = (reason = null) => singleLayerPlan(activeStrategy, finalAmountX, finalAmountY, strategyMap, reason);
   if (!allowMultiLayer) return single();
   if (!strategyConfig.multiLayerEnabled) return single();
+  const minDeploySol = Math.max(0, Number(strategyConfig.multiLayerMinDeploySol ?? 0));
+  if (finalAmountY < minDeploySol) {
+    return single(`deploy ${finalAmountY} SOL below multi-layer minimum ${minDeploySol} SOL`);
+  }
   if (finalAmountX > 0) return single("multi-layer disabled for token-side deposits");
   if (strategyConfig.multiLayerMode !== "same_position") return single(`unsupported multiLayerMode ${strategyConfig.multiLayerMode}`);
 
@@ -226,6 +230,40 @@ export function buildLayerPlan({
     effectiveStrategy: "multi_layer",
     fallbackReason: null,
     layers: plannedLayers,
+  };
+}
+
+export function resolveRegimeStrategy({
+  configuredStrategy,
+  volatility,
+  strategyWasExplicit = false,
+  strategyConfig = config.strategy,
+}) {
+  const fallbackStrategy = String(configuredStrategy || strategyConfig.strategy || "bid_ask").trim();
+  if (strategyWasExplicit || !strategyConfig.regimeStrategyEnabled || !Number.isFinite(volatility)) {
+    return { strategy: fallbackStrategy, regime: "configured", allowMultiLayer: true };
+  }
+
+  const lowMax = Number(strategyConfig.regimeLowVolMax ?? 1);
+  const highMin = Math.max(lowMax, Number(strategyConfig.regimeHighVolMin ?? 2));
+  if (volatility <= lowMax) {
+    return {
+      strategy: String(strategyConfig.regimeLowVolStrategy || "spot").trim(),
+      regime: "compression",
+      allowMultiLayer: false,
+    };
+  }
+  if (volatility >= highMin) {
+    return {
+      strategy: String(strategyConfig.regimeHighVolStrategy || "bid_ask").trim(),
+      regime: "expansion",
+      allowMultiLayer: false,
+    };
+  }
+  return {
+    strategy: String(strategyConfig.regimeMidVolStrategy || fallbackStrategy).trim(),
+    regime: "balanced",
+    allowMultiLayer: true,
   };
 }
 
@@ -625,11 +663,16 @@ export async function deployPosition({
 }) {
   pool_address = normalizeMint(pool_address);
   const strategyWasExplicit = strategy != null && String(strategy).trim() !== "";
-  const activeStrategy = strategyWasExplicit ? String(strategy).trim() : config.strategy.strategy;
   let activeBinsBelow = bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow;
   let activeBinsAbove = bins_above ?? 0;
   const parsedVolatility = volatility == null ? null : Number(volatility);
   const normalizedVolatility = parsedVolatility != null && Number.isFinite(parsedVolatility) ? parsedVolatility : null;
+  const regimePlan = resolveRegimeStrategy({
+    configuredStrategy: strategyWasExplicit ? String(strategy).trim() : config.strategy.strategy,
+    volatility: normalizedVolatility,
+    strategyWasExplicit,
+  });
+  const activeStrategy = regimePlan.strategy;
 
   if (volatility != null && (normalizedVolatility == null || normalizedVolatility <= 0)) {
     throw new Error(`Invalid volatility ${volatility} — refusing deploy because the volatility feed is unusable.`);
@@ -774,13 +817,14 @@ export async function deployPosition({
     finalAmountX,
     finalAmountY,
     strategyMap,
-    allowMultiLayer: shouldAllowMultiLayerForStrategy({ strategyWasExplicit, activeStrategy }),
+    allowMultiLayer: regimePlan.allowMultiLayer && shouldAllowMultiLayerForStrategy({ strategyWasExplicit, activeStrategy }),
   });
   const effectiveStrategy = layerPlan.effectiveStrategy;
   const layerMetadata = layerPlan.layers.map(publicLayer);
   if (layerPlan.fallbackReason) {
     log("deploy", `Multi-layer fallback: ${layerPlan.fallbackReason}`);
   }
+  log("deploy", `Regime: ${regimePlan.regime}, volatility: ${normalizedVolatility ?? "n/a"}, selected strategy: ${effectiveStrategy}`);
 
   if (process.env.DRY_RUN === "true") {
     const paperPosition = trackPaperPosition({
@@ -1333,7 +1377,7 @@ function pnlOutlierReason({ pnlPct, derivedPnlPct, pnlPctDiff, ageMinutes }) {
     Number.isFinite(ageMinutes) &&
     Number.isFinite(newPositionMinutes) &&
     Number.isFinite(newPositionMaxPct) &&
-    ageMinutes < newPositionMinutes &&
+    ageMinutes <= newPositionMinutes &&
     absPnl >= newPositionMaxPct
   ) {
     return `new-position outlier ${pnlPct.toFixed(2)}% at ${ageMinutes}m`;

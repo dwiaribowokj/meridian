@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { buildLayerPlan, shouldAllowMultiLayerForStrategy } from "../tools/dlmm.js";
+import { buildLayerPlan, resolveRegimeStrategy, shouldAllowMultiLayerForStrategy } from "../tools/dlmm.js";
 
 const strategyMap = {
   spot: 0,
@@ -60,11 +60,52 @@ function plan(strategyConfig, extra = {}) {
       { strategy: "spot", pct: 30 },
     ],
     multiLayerMinLayerSol: 0.05,
+    multiLayerMinDeploySol: 0.3,
   });
   assert.equal(result.multiLayer, true);
   assert.equal(result.effectiveStrategy, "multi_layer");
   assert.deepEqual(result.layers.map((layer) => layer.strategy), ["bid_ask", "spot"]);
   assert.deepEqual(result.layers.map((layer) => layer.amount_y), [0.21, 0.09]);
+}
+
+{
+  const result = plan({
+    multiLayerEnabled: true,
+    multiLayerMode: "same_position",
+    multiLayerLayers: [
+      { strategy: "bid_ask", pct: 70 },
+      { strategy: "spot", pct: 30 },
+    ],
+    multiLayerMinDeploySol: 0.4,
+  });
+  assert.equal(result.multiLayer, false);
+  assert.match(result.fallbackReason, /below multi-layer minimum/);
+}
+
+{
+  const strategyConfig = {
+    regimeStrategyEnabled: true,
+    regimeLowVolMax: 1,
+    regimeHighVolMin: 2,
+    regimeLowVolStrategy: "spot",
+    regimeMidVolStrategy: "bid_ask",
+    regimeHighVolStrategy: "bid_ask",
+  };
+  assert.deepEqual(resolveRegimeStrategy({ configuredStrategy: "bid_ask", volatility: 0.8, strategyConfig }), {
+    strategy: "spot",
+    regime: "compression",
+    allowMultiLayer: false,
+  });
+  assert.deepEqual(resolveRegimeStrategy({ configuredStrategy: "bid_ask", volatility: 1.5, strategyConfig }), {
+    strategy: "bid_ask",
+    regime: "balanced",
+    allowMultiLayer: true,
+  });
+  assert.deepEqual(resolveRegimeStrategy({ configuredStrategy: "bid_ask", volatility: 2.5, strategyConfig }), {
+    strategy: "bid_ask",
+    regime: "expansion",
+    allowMultiLayer: false,
+  });
 }
 
 {
