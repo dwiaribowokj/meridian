@@ -41,6 +41,7 @@ const TIMEFRAME_MINUTES = {
   "12h": 720,
   "24h": 1440,
 };
+const candidateObservations = new Map();
 import { log, logAction } from "../logger.js";
 import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
 
@@ -66,6 +67,47 @@ function poolDetailBinStep(pool) {
 
 function poolDetailFeeActiveTvlRatio(pool) {
   return numberOrNull(pool?.fee_active_tvl_ratio);
+}
+
+function poolDetailVolume(pool) {
+  return numberOrNull(pool?.volume);
+}
+
+function confirmCandidateStability(poolAddress, { feeActiveTvlRatio, volume }) {
+  const s = config.screening;
+  if (!s.candidateConfirmationEnabled || Number(s.candidateConfirmationCount) <= 1) {
+    return { pass: true };
+  }
+
+  const now = Date.now();
+  const maxAgeMs = Number(s.candidateConfirmationMaxAgeMinutes) * 60_000;
+  const previous = candidateObservations.get(poolAddress);
+  const current = { feeActiveTvlRatio, volume, count: 1, observedAt: now };
+
+  if (!previous || now - previous.observedAt > maxAgeMs) {
+    candidateObservations.set(poolAddress, current);
+    return { pass: false, reason: `Candidate confirmation 1/${s.candidateConfirmationCount}; waiting for another stable observation.` };
+  }
+
+  const feeRetentionPct = previous.feeActiveTvlRatio > 0
+    ? (feeActiveTvlRatio / previous.feeActiveTvlRatio) * 100
+    : 100;
+  const volumeRetentionPct = previous.volume > 0 ? (volume / previous.volume) * 100 : 100;
+  const count = previous.count + 1;
+  candidateObservations.set(poolAddress, { ...current, count });
+
+  if (feeRetentionPct < Number(s.candidateMinFeeRetentionPct)) {
+    return { pass: false, reason: `Candidate fee weakened to ${feeRetentionPct.toFixed(1)}% of the prior observation; minimum retention is ${s.candidateMinFeeRetentionPct}%.` };
+  }
+  if (volumeRetentionPct < Number(s.candidateMinVolumeRetentionPct)) {
+    return { pass: false, reason: `Candidate volume weakened to ${volumeRetentionPct.toFixed(1)}% of the prior observation; minimum retention is ${s.candidateMinVolumeRetentionPct}%.` };
+  }
+  if (count < Number(s.candidateConfirmationCount)) {
+    return { pass: false, reason: `Candidate confirmation ${count}/${s.candidateConfirmationCount}; waiting for another stable observation.` };
+  }
+
+  candidateObservations.delete(poolAddress);
+  return { pass: true, feeRetentionPct, volumeRetentionPct };
 }
 
 function poolDetailVolatility(pool) {
@@ -140,6 +182,18 @@ async function validateDeployPoolThresholds(args) {
       reason: `Pool fee/active-TVL ${feeActiveTvlRatio ?? "unknown"}% is below configured minFeeActiveTvlRatio ${minFeeActiveTvlRatio}%.`,
     };
   }
+
+  const volume = poolDetailVolume(detail);
+  const minVolume = numberOrNull(config.screening.minVolume);
+  if (minVolume != null && minVolume > 0 && (volume == null || volume < minVolume)) {
+    return {
+      pass: false,
+      reason: `Pool volume ${volume ?? "unknown"} is below configured minVolume ${minVolume}.`,
+    };
+  }
+
+  const confirmation = confirmCandidateStability(args.pool_address, { feeActiveTvlRatio, volume });
+  if (!confirmation.pass) return confirmation;
 
   const volatilityTimeframe = getVolatilityTimeframe(config.screening.timeframe || "5m");
   let volatilityDetail = detail;

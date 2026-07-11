@@ -240,7 +240,8 @@ export function resolveRegimeStrategy({
   strategyConfig = config.strategy,
 }) {
   const fallbackStrategy = String(configuredStrategy || strategyConfig.strategy || "bid_ask").trim();
-  if (strategyWasExplicit || !strategyConfig.regimeStrategyEnabled || !Number.isFinite(volatility)) {
+  const explicitStrategyWins = strategyWasExplicit && strategyConfig.regimeOverrideExplicitStrategy === false;
+  if (explicitStrategyWins || !strategyConfig.regimeStrategyEnabled || !Number.isFinite(volatility)) {
     return { strategy: fallbackStrategy, regime: "configured", allowMultiLayer: true };
   }
 

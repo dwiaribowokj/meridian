@@ -131,6 +131,11 @@ export const config = {
     extraSearchSymbols: normalizeStringList(u.extraSearchSymbols),
     extraSearchLimitPerSymbol: Number(u.extraSearchLimitPerSymbol ?? 6),
     extraSearchOnlySolPools: u.extraSearchOnlySolPools ?? true,
+    candidateConfirmationEnabled: u.candidateConfirmationEnabled ?? true,
+    candidateConfirmationCount: Math.max(1, Number(u.candidateConfirmationCount ?? 2)),
+    candidateConfirmationMaxAgeMinutes: Math.max(1, Number(u.candidateConfirmationMaxAgeMinutes ?? 15)),
+    candidateMinFeeRetentionPct: Math.max(0, Number(u.candidateMinFeeRetentionPct ?? 70)),
+    candidateMinVolumeRetentionPct: Math.max(0, Number(u.candidateMinVolumeRetentionPct ?? 70)),
   },
 
   // ─── Position Management ────────────────
@@ -226,6 +231,7 @@ export const config = {
     multiLayerMinSecondarySol: Number(u.multiLayerMinSecondarySol ?? u.multiLayerMinLayerSol ?? 0.05),
     multiLayerMinDeploySol: Number(u.multiLayerMinDeploySol ?? 0.3),
     regimeStrategyEnabled: u.regimeStrategyEnabled ?? false,
+    regimeOverrideExplicitStrategy: u.regimeOverrideExplicitStrategy ?? true,
     regimeLowVolMax: Number(u.regimeLowVolMax ?? 1),
     regimeHighVolMin: Number(u.regimeHighVolMin ?? 2),
     regimeLowVolStrategy: u.regimeLowVolStrategy ?? "spot",
@@ -427,6 +433,11 @@ export function reloadScreeningThresholds() {
     if (fresh.extraSearchSymbols !== undefined) s.extraSearchSymbols = normalizeStringList(fresh.extraSearchSymbols);
     if (fresh.extraSearchLimitPerSymbol != null) s.extraSearchLimitPerSymbol = Number(fresh.extraSearchLimitPerSymbol);
     if (fresh.extraSearchOnlySolPools !== undefined) s.extraSearchOnlySolPools = fresh.extraSearchOnlySolPools;
+    if (fresh.candidateConfirmationEnabled !== undefined) s.candidateConfirmationEnabled = fresh.candidateConfirmationEnabled;
+    if (fresh.candidateConfirmationCount != null) s.candidateConfirmationCount = Math.max(1, Number(fresh.candidateConfirmationCount));
+    if (fresh.candidateConfirmationMaxAgeMinutes != null) s.candidateConfirmationMaxAgeMinutes = Math.max(1, Number(fresh.candidateConfirmationMaxAgeMinutes));
+    if (fresh.candidateMinFeeRetentionPct != null) s.candidateMinFeeRetentionPct = Math.max(0, Number(fresh.candidateMinFeeRetentionPct));
+    if (fresh.candidateMinVolumeRetentionPct != null) s.candidateMinVolumeRetentionPct = Math.max(0, Number(fresh.candidateMinVolumeRetentionPct));
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelow = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;
@@ -455,6 +466,7 @@ export function reloadScreeningThresholds() {
     if (fresh.multiLayerMinSecondarySol != null) config.strategy.multiLayerMinSecondarySol = Number(fresh.multiLayerMinSecondarySol);
     if (fresh.multiLayerMinDeploySol != null) config.strategy.multiLayerMinDeploySol = Number(fresh.multiLayerMinDeploySol);
     if (fresh.regimeStrategyEnabled !== undefined) config.strategy.regimeStrategyEnabled = fresh.regimeStrategyEnabled;
+    if (fresh.regimeOverrideExplicitStrategy !== undefined) config.strategy.regimeOverrideExplicitStrategy = fresh.regimeOverrideExplicitStrategy;
     if (fresh.regimeLowVolMax != null) config.strategy.regimeLowVolMax = Number(fresh.regimeLowVolMax);
     if (fresh.regimeHighVolMin != null) config.strategy.regimeHighVolMin = Number(fresh.regimeHighVolMin);
     if (fresh.regimeLowVolStrategy != null) config.strategy.regimeLowVolStrategy = fresh.regimeLowVolStrategy;

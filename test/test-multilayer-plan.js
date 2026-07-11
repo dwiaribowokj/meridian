@@ -85,6 +85,7 @@ function plan(strategyConfig, extra = {}) {
 {
   const strategyConfig = {
     regimeStrategyEnabled: true,
+    regimeOverrideExplicitStrategy: true,
     regimeLowVolMax: 1,
     regimeHighVolMin: 2,
     regimeLowVolStrategy: "spot",
@@ -95,6 +96,21 @@ function plan(strategyConfig, extra = {}) {
     strategy: "spot",
     regime: "compression",
     allowMultiLayer: false,
+  });
+  assert.deepEqual(resolveRegimeStrategy({ configuredStrategy: "bid_ask", volatility: 0.8, strategyWasExplicit: true, strategyConfig }), {
+    strategy: "spot",
+    regime: "compression",
+    allowMultiLayer: false,
+  });
+  assert.deepEqual(resolveRegimeStrategy({
+    configuredStrategy: "bid_ask",
+    volatility: 0.8,
+    strategyWasExplicit: true,
+    strategyConfig: { ...strategyConfig, regimeOverrideExplicitStrategy: false },
+  }), {
+    strategy: "bid_ask",
+    regime: "configured",
+    allowMultiLayer: true,
   });
   assert.deepEqual(resolveRegimeStrategy({ configuredStrategy: "bid_ask", volatility: 1.5, strategyConfig }), {
     strategy: "bid_ask",
