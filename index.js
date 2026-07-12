@@ -34,6 +34,7 @@ import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
+import { clearCandidateObservation, observeCandidateStability } from "./candidate-observations.js";
 
 import { REPO_ROOT, repoPath } from "./repo-root.js";
 
@@ -540,7 +541,7 @@ export async function runScreeningCycle({ silent = false, fillSlots = true } = {
 
     // Hard filters after token recon — block launchpads and excessive Jupiter bot holders
     const filteredOut = [];
-    const passing = allCandidates.filter(({ pool, ti }) => {
+    const qualityPassing = allCandidates.filter(({ pool, ti }) => {
       const launchpad = ti?.launchpad ?? null;
       if (launchpad && config.screening.allowedLaunchpads?.length > 0 && !config.screening.allowedLaunchpads.includes(launchpad)) {
         log("screening", `Skipping ${pool.name} — launchpad ${launchpad} not in allow-list`);
@@ -561,6 +562,40 @@ export async function runScreeningCycle({ silent = false, fillSlots = true } = {
       }
       return true;
     });
+
+    // Stability and regime gates run before the LLM. This avoids spending tokens on
+    // candidates that have not survived multiple independent screening observations.
+    const passing = [];
+    for (const candidate of qualityPassing) {
+      const { pool } = candidate;
+      const volatility = Number(pool.volatility);
+      if (
+        config.strategy.regimeHighVolAction === "skip" &&
+        Number.isFinite(volatility) &&
+        volatility >= Number(config.strategy.regimeHighVolMin ?? 2)
+      ) {
+        const reason = `expansion regime volatility ${volatility} >= ${config.strategy.regimeHighVolMin}`;
+        log("screening", `Regime gate: dropped ${pool.name} — ${reason}`);
+        filteredOut.push({ name: pool.name, reason });
+        continue;
+      }
+
+      const stability = observeCandidateStability(
+        pool.pool,
+        {
+          feeActiveTvlRatio: pool.fee_active_tvl_ratio,
+          volume: pool.volume_window ?? pool.volume,
+        },
+        config.screening,
+      );
+      candidate.stability = stability;
+      if (!stability.pass) {
+        log("screening", `Stability gate: held ${pool.name} — ${stability.reason}`);
+        filteredOut.push({ name: pool.name, reason: stability.reason });
+        continue;
+      }
+      passing.push(candidate);
+    }
 
     if (passing.length === 0) {
       const combined = filteredOut.length > 0 ? filteredOut : earlyFilteredExamples;
@@ -740,10 +775,11 @@ IMPORTANT:
           if (name === "deploy_position") deployAttempted = true;
           await liveMessage?.toolStart(name);
         },
-        onToolFinish: async ({ name, result, success }) => {
+        onToolFinish: async ({ name, args, result, success }) => {
           if (name === "deploy_position") {
             deployAttempted = true;
             deploySucceeded = Boolean(success && result?.success !== false && !result?.error && !result?.blocked);
+            if (deploySucceeded) clearCandidateObservation(result?.pool ?? args?.pool_address);
           }
           await liveMessage?.toolFinish(name, result, success);
         },
@@ -873,11 +909,15 @@ Summarize the current portfolio health, total fees earned, and performance of al
         if (exit) { signal = exit.action; reason = exit.reason; }
         else if (closeRule) { signal = `RULE_${closeRule.rule}`; reason = closeRule.reason; rule = closeRule.rule; }
 
-        // Require N consecutive confirming ticks before acting.
-        const { fire } = registerExitSignal(p.position, signal, confirmTicks);
+        // Profit capture is latency-sensitive; loss and range exits retain the
+        // normal multi-tick noise guard.
+        const requiredTicks = signal === "RULE_2"
+          ? Math.max(1, Number(config.pnl.profitConfirmTicks ?? 1))
+          : confirmTicks;
+        const { fire } = registerExitSignal(p.position, signal, requiredTicks);
         if (!signal || !fire) continue;
 
-        log("state", `[PnL poll] ${signal} confirmed (${confirmTicks} ticks): ${p.pair} — ${reason} — closing directly`);
+        log("state", `[PnL poll] ${signal} confirmed (${requiredTicks} ticks): ${p.pair} — ${reason} — closing directly`);
         // Hold the management lock so the cron cycle can't double-act on this position.
         _managementBusy = true;
         try {
@@ -1029,6 +1069,14 @@ function formatCandidates(candidates) {
   ].join("\n");
 }
 
+export function getEffectiveTakeProfitPct(managementConfig) {
+  const configured = Number(managementConfig.takeProfitPct ?? 5);
+  if (managementConfig.costAwareTakeProfitEnabled === false) return configured;
+  const costFloor = Number(managementConfig.estimatedRoundTripCostPct ?? 1.0) +
+    Number(managementConfig.minNetProfitPct ?? 0.25);
+  return Math.max(configured, costFloor);
+}
+
 function getDeterministicCloseRule(position, managementConfig) {
   const tracked = getTrackedPosition(position.position);
   const pnlSuspect = (() => {
@@ -1046,8 +1094,9 @@ function getDeterministicCloseRule(position, managementConfig) {
   if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct <= managementConfig.stopLossPct) {
     return { action: "CLOSE", rule: 1, reason: "stop loss" };
   }
-  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct >= managementConfig.takeProfitPct) {
-    return { action: "CLOSE", rule: 2, reason: "take profit" };
+  const effectiveTakeProfitPct = getEffectiveTakeProfitPct(managementConfig);
+  if (!pnlSuspect && position.pnl_pct != null && position.pnl_pct >= effectiveTakeProfitPct) {
+    return { action: "CLOSE", rule: 2, reason: `cost-aware take profit (${effectiveTakeProfitPct.toFixed(2)}%)` };
   }
   if (
     position.active_bin != null &&

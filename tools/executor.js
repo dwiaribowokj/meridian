@@ -28,6 +28,7 @@ import fs from "fs";
 import { execSync, spawn } from "child_process";
 import { REPO_ROOT, repoPath } from "../repo-root.js";
 import { normalizeTimeframe, scaleScreeningToTimeframe } from "../screening-scales.js";
+import { validateCandidateStability } from "../candidate-observations.js";
 
 const USER_CONFIG_PATH = repoPath("user-config.json");
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
@@ -41,7 +42,6 @@ const TIMEFRAME_MINUTES = {
   "12h": 720,
   "24h": 1440,
 };
-const candidateObservations = new Map();
 import { log, logAction } from "../logger.js";
 import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
 
@@ -71,43 +71,6 @@ function poolDetailFeeActiveTvlRatio(pool) {
 
 function poolDetailVolume(pool) {
   return numberOrNull(pool?.volume);
-}
-
-function confirmCandidateStability(poolAddress, { feeActiveTvlRatio, volume }) {
-  const s = config.screening;
-  if (!s.candidateConfirmationEnabled || Number(s.candidateConfirmationCount) <= 1) {
-    return { pass: true };
-  }
-
-  const now = Date.now();
-  const maxAgeMs = Number(s.candidateConfirmationMaxAgeMinutes) * 60_000;
-  const previous = candidateObservations.get(poolAddress);
-  const current = { feeActiveTvlRatio, volume, count: 1, observedAt: now };
-
-  if (!previous || now - previous.observedAt > maxAgeMs) {
-    candidateObservations.set(poolAddress, current);
-    return { pass: false, reason: `Candidate confirmation 1/${s.candidateConfirmationCount}; waiting for another stable observation.` };
-  }
-
-  const feeRetentionPct = previous.feeActiveTvlRatio > 0
-    ? (feeActiveTvlRatio / previous.feeActiveTvlRatio) * 100
-    : 100;
-  const volumeRetentionPct = previous.volume > 0 ? (volume / previous.volume) * 100 : 100;
-  const count = previous.count + 1;
-  candidateObservations.set(poolAddress, { ...current, count });
-
-  if (feeRetentionPct < Number(s.candidateMinFeeRetentionPct)) {
-    return { pass: false, reason: `Candidate fee weakened to ${feeRetentionPct.toFixed(1)}% of the prior observation; minimum retention is ${s.candidateMinFeeRetentionPct}%.` };
-  }
-  if (volumeRetentionPct < Number(s.candidateMinVolumeRetentionPct)) {
-    return { pass: false, reason: `Candidate volume weakened to ${volumeRetentionPct.toFixed(1)}% of the prior observation; minimum retention is ${s.candidateMinVolumeRetentionPct}%.` };
-  }
-  if (count < Number(s.candidateConfirmationCount)) {
-    return { pass: false, reason: `Candidate confirmation ${count}/${s.candidateConfirmationCount}; waiting for another stable observation.` };
-  }
-
-  candidateObservations.delete(poolAddress);
-  return { pass: true, feeRetentionPct, volumeRetentionPct };
 }
 
 function poolDetailVolatility(pool) {
@@ -192,9 +155,6 @@ async function validateDeployPoolThresholds(args) {
     };
   }
 
-  const confirmation = confirmCandidateStability(args.pool_address, { feeActiveTvlRatio, volume });
-  if (!confirmation.pass) return confirmation;
-
   const volatilityTimeframe = getVolatilityTimeframe(config.screening.timeframe || "5m");
   let volatilityDetail = detail;
   if ((config.screening.timeframe || "5m") !== volatilityTimeframe) {
@@ -215,6 +175,22 @@ async function validateDeployPoolThresholds(args) {
       reason: `Pool ${volatilityTimeframe} volatility ${volatility ?? "unknown"} is unusable. Refusing deploy.`,
     };
   }
+  if (
+    config.strategy.regimeHighVolAction === "skip" &&
+    volatility >= Number(config.strategy.regimeHighVolMin ?? 2)
+  ) {
+    return {
+      pass: false,
+      reason: `Expansion regime blocked: volatility ${volatility} >= ${config.strategy.regimeHighVolMin}.`,
+    };
+  }
+
+  const confirmation = validateCandidateStability(
+    args.pool_address,
+    { feeActiveTvlRatio, volume },
+    config.screening,
+  );
+  if (!confirmation.pass) return confirmation;
 
   const actualBinStep = poolDetailBinStep(detail);
   const minStep = numberOrNull(config.screening.minBinStep);
@@ -316,6 +292,9 @@ function normalizeConfigValue(key, value) {
     "multiLayerEnabled",
     "indicatorHardFilter",
     "extraSearchOnlySolPools",
+    "candidateConfirmationEnabled",
+    "regimeOverrideExplicitStrategy",
+    "costAwareTakeProfitEnabled",
   ]);
   const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads", "extraSearchSymbols"]);
   const layerArrayKeys = new Set(["multiLayerLayers"]);
@@ -340,11 +319,22 @@ function normalizeConfigValue(key, value) {
     "multiLayerMode",
     "multiLayerPrimaryStrategy",
     "multiLayerSecondaryStrategy",
+    "regimeLowVolStrategy",
+    "regimeMidVolStrategy",
+    "regimeHighVolStrategy",
+    "regimeHighVolAction",
   ]);
   if (value === null) return null;
   if (booleanKeys.has(key)) return coerceBoolean(value, key);
   if (arrayKeys.has(key)) return coerceStringArray(value, key);
   if (layerArrayKeys.has(key)) return coerceMultiLayerLayers(value, key);
+  if (key === "regimeHighVolAction") {
+    const action = coerceString(value, key).toLowerCase();
+    if (action !== "skip" && action !== "deploy") {
+      throw new Error(`${key} must be skip or deploy`);
+    }
+    return action;
+  }
   if (stringKeys.has(key)) return coerceString(value, key);
   return coerceFiniteNumber(value, key);
 }
@@ -478,6 +468,12 @@ const toolMap = {
       extraSearchSymbols: ["screening", "extraSearchSymbols"],
       extraSearchLimitPerSymbol: ["screening", "extraSearchLimitPerSymbol"],
       extraSearchOnlySolPools: ["screening", "extraSearchOnlySolPools"],
+      candidateConfirmationEnabled: ["screening", "candidateConfirmationEnabled"],
+      candidateConfirmationCount: ["screening", "candidateConfirmationCount"],
+      candidateConfirmationMaxAgeMinutes: ["screening", "candidateConfirmationMaxAgeMinutes"],
+      candidateConfirmationMinSpacingMinutes: ["screening", "candidateConfirmationMinSpacingMinutes"],
+      candidateMinFeeRetentionPct: ["screening", "candidateMinFeeRetentionPct"],
+      candidateMinVolumeRetentionPct: ["screening", "candidateMinVolumeRetentionPct"],
       minFeePerTvl24h: ["management", "minFeePerTvl24h"],
       loneCandidateMinDegen: ["screening", "loneCandidateMinDegen"],
       // management
@@ -502,6 +498,10 @@ const toolMap = {
       stopLossPct: ["management", "stopLossPct"],
       takeProfitPct: ["management", "takeProfitPct"],
       takeProfitFeePct: ["management", "takeProfitPct"],
+      costAwareTakeProfitEnabled: ["management", "costAwareTakeProfitEnabled"],
+      estimatedRoundTripCostPct: ["management", "estimatedRoundTripCostPct"],
+      minNetProfitPct: ["management", "minNetProfitPct"],
+      poolMemoryMaxNetPnlDiffPct: ["management", "poolMemoryMaxNetPnlDiffPct"],
       trailingTakeProfit: ["management", "trailingTakeProfit"],
       trailingTriggerPct: ["management", "trailingTriggerPct"],
       trailingDropPct: ["management", "trailingDropPct"],
@@ -537,6 +537,7 @@ const toolMap = {
       pnlDivergenceGateMinPct: ["management", "pnlDivergenceGateMinPct"],
       // pnl poller
       pnlConfirmTicks: ["pnl", "confirmTicks"],
+      pnlProfitConfirmTicks: ["pnl", "profitConfirmTicks"],
       // opportunity poller (interval/enabled changes apply on next restart)
       opportunityPollEnabled: ["opportunity", "enabled"],
       opportunityPollIntervalSec: ["opportunity", "pollIntervalSec"],
@@ -588,11 +589,13 @@ const toolMap = {
       multiLayerMinSecondarySol: ["strategy", "multiLayerMinSecondarySol"],
       multiLayerMinDeploySol: ["strategy", "multiLayerMinDeploySol"],
       regimeStrategyEnabled: ["strategy", "regimeStrategyEnabled"],
+      regimeOverrideExplicitStrategy: ["strategy", "regimeOverrideExplicitStrategy"],
       regimeLowVolMax: ["strategy", "regimeLowVolMax"],
       regimeHighVolMin: ["strategy", "regimeHighVolMin"],
       regimeLowVolStrategy: ["strategy", "regimeLowVolStrategy"],
       regimeMidVolStrategy: ["strategy", "regimeMidVolStrategy"],
       regimeHighVolStrategy: ["strategy", "regimeHighVolStrategy"],
+      regimeHighVolAction: ["strategy", "regimeHighVolAction"],
       // hivemind
       hiveMindUrl: ["hiveMind", "url"],
       hiveMindApiKey: ["hiveMind", "apiKey"],
@@ -735,7 +738,14 @@ const toolMap = {
     fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
 
     // Restart cron jobs if intervals changed
-    const intervalChanged = applied.managementIntervalMin != null || applied.screeningIntervalMin != null || applied.pnlPollIntervalSec != null;
+    const intervalChanged =
+      applied.managementIntervalMin != null ||
+      applied.screeningIntervalMin != null ||
+      applied.pnlPollIntervalSec != null ||
+      applied.pnlConfirmTicks != null ||
+      applied.pnlProfitConfirmTicks != null ||
+      applied.opportunityPollEnabled != null ||
+      applied.opportunityPollIntervalSec != null;
     if (intervalChanged && _cronRestarter) {
       _cronRestarter();
       log("config", `Cron restarted — management: ${config.schedule.managementIntervalMin}m, screening: ${config.schedule.screeningIntervalMin}m, pnlPoll: ${config.pnl.pollIntervalSec}s`);

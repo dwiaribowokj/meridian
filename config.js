@@ -92,6 +92,11 @@ function normalizeStringList(value) {
     : [];
 }
 
+function normalizeRegimeHighVolAction(value, fallback = "deploy") {
+  const normalized = String(value ?? fallback).trim().toLowerCase();
+  return normalized === "skip" || normalized === "deploy" ? normalized : fallback;
+}
+
 export const config = {
   // ─── Risk Limits ─────────────────────────
   risk: {
@@ -134,6 +139,7 @@ export const config = {
     candidateConfirmationEnabled: u.candidateConfirmationEnabled ?? true,
     candidateConfirmationCount: Math.max(1, Number(u.candidateConfirmationCount ?? 2)),
     candidateConfirmationMaxAgeMinutes: Math.max(1, Number(u.candidateConfirmationMaxAgeMinutes ?? 15)),
+    candidateConfirmationMinSpacingMinutes: Math.max(0, Number(u.candidateConfirmationMinSpacingMinutes ?? 2)),
     candidateMinFeeRetentionPct: Math.max(0, Number(u.candidateMinFeeRetentionPct ?? 70)),
     candidateMinVolumeRetentionPct: Math.max(0, Number(u.candidateMinVolumeRetentionPct ?? 70)),
   },
@@ -160,6 +166,10 @@ export const config = {
     minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
     stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -50,
     takeProfitPct:         u.takeProfitPct         ?? u.takeProfitFeePct ?? 5,
+    costAwareTakeProfitEnabled: u.costAwareTakeProfitEnabled ?? true,
+    estimatedRoundTripCostPct: Math.max(0, Number(u.estimatedRoundTripCostPct ?? 1.0)),
+    minNetProfitPct: Math.max(0, Number(u.minNetProfitPct ?? 0.25)),
+    poolMemoryMaxNetPnlDiffPct: Math.max(0, Number(u.poolMemoryMaxNetPnlDiffPct ?? 3)),
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
     deadPositionCheck1Minutes: u.deadPositionCheck1Minutes ?? 90,
@@ -237,6 +247,7 @@ export const config = {
     regimeLowVolStrategy: u.regimeLowVolStrategy ?? "spot",
     regimeMidVolStrategy: u.regimeMidVolStrategy ?? u.strategy ?? "bid_ask",
     regimeHighVolStrategy: u.regimeHighVolStrategy ?? "bid_ask",
+    regimeHighVolAction: normalizeRegimeHighVolAction(u.regimeHighVolAction),
   },
 
   // ─── Scheduling ─────────────────────────
@@ -310,6 +321,7 @@ export const config = {
     // At a 3s poll cadence, 2 ticks ≈ 3-6s — filters single-tick noise without the
     // old fixed 15s setTimeout recheck.
     confirmTicks: Number(u.pnlConfirmTicks ?? 2),
+    profitConfirmTicks: Number(u.pnlProfitConfirmTicks ?? 1),
   },
 
   // ─── Opportunity poller (catches strong pools between screening cycles) ──
@@ -436,6 +448,7 @@ export function reloadScreeningThresholds() {
     if (fresh.candidateConfirmationEnabled !== undefined) s.candidateConfirmationEnabled = fresh.candidateConfirmationEnabled;
     if (fresh.candidateConfirmationCount != null) s.candidateConfirmationCount = Math.max(1, Number(fresh.candidateConfirmationCount));
     if (fresh.candidateConfirmationMaxAgeMinutes != null) s.candidateConfirmationMaxAgeMinutes = Math.max(1, Number(fresh.candidateConfirmationMaxAgeMinutes));
+    if (fresh.candidateConfirmationMinSpacingMinutes != null) s.candidateConfirmationMinSpacingMinutes = Math.max(0, Number(fresh.candidateConfirmationMinSpacingMinutes));
     if (fresh.candidateMinFeeRetentionPct != null) s.candidateMinFeeRetentionPct = Math.max(0, Number(fresh.candidateMinFeeRetentionPct));
     if (fresh.candidateMinVolumeRetentionPct != null) s.candidateMinVolumeRetentionPct = Math.max(0, Number(fresh.candidateMinVolumeRetentionPct));
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
@@ -472,5 +485,11 @@ export function reloadScreeningThresholds() {
     if (fresh.regimeLowVolStrategy != null) config.strategy.regimeLowVolStrategy = fresh.regimeLowVolStrategy;
     if (fresh.regimeMidVolStrategy != null) config.strategy.regimeMidVolStrategy = fresh.regimeMidVolStrategy;
     if (fresh.regimeHighVolStrategy != null) config.strategy.regimeHighVolStrategy = fresh.regimeHighVolStrategy;
+    if (fresh.regimeHighVolAction != null) {
+      config.strategy.regimeHighVolAction = normalizeRegimeHighVolAction(
+        fresh.regimeHighVolAction,
+        config.strategy.regimeHighVolAction,
+      );
+    }
   } catch { /* ignore */ }
 }

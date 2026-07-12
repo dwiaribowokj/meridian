@@ -74,6 +74,57 @@ function isStopLossCloseReason(reason) {
   return String(reason || "").toLowerCase().includes("stop loss");
 }
 
+export function cleanNetPnlPct(deploy) {
+  if (deploy.position_sol_deployed == null || deploy.wallet_sol_roundtrip_delta_after_autoswap == null) {
+    return null;
+  }
+  const deployed = Number(deploy.position_sol_deployed);
+  const walletDelta = Number(deploy.wallet_sol_roundtrip_delta_after_autoswap);
+  if (!Number.isFinite(deployed) || deployed <= 0 || !Number.isFinite(walletDelta)) return null;
+  const netPct = (walletDelta / deployed) * 100;
+  const grossPct = Number(deploy.position_sol_pnl_pct ?? deploy.pnl_pct);
+  const maxDiffPct = Math.max(0, Number(config.management.poolMemoryMaxNetPnlDiffPct ?? 3));
+  if (Number.isFinite(grossPct) && Math.abs(netPct - grossPct) > maxDiffPct) return null;
+  return netPct;
+}
+
+export function recomputeAggregates(entry) {
+  const withPnl = entry.deploys.filter((d) => d.pnl_pct != null);
+  if (withPnl.length > 0) {
+    entry.avg_pnl_pct = Math.round(
+      (withPnl.reduce((s, d) => s + d.pnl_pct, 0) / withPnl.length) * 100
+    ) / 100;
+    entry.win_rate = Math.round(
+      (withPnl.filter((d) => d.pnl_pct >= 0).length / withPnl.length) * 10000
+    ) / 100;
+  }
+
+  const adjusted = withPnl.filter((d) => !isAdjustedWinRateExcludedReason(d.close_reason));
+  entry.adjusted_win_rate_sample_count = adjusted.length;
+  entry.adjusted_win_rate = adjusted.length > 0
+    ? Math.round((adjusted.filter((d) => d.pnl_pct >= 0).length / adjusted.length) * 10000) / 100
+    : 0;
+
+  const recentNet = entry.deploys.slice(-10)
+    .map((deploy) => ({ deploy, netPct: cleanNetPnlPct(deploy) }))
+    .filter((item) => item.netPct != null);
+  entry.recent_net_sample_count = recentNet.length;
+  entry.recent_net_avg_pct = recentNet.length > 0
+    ? Math.round((recentNet.reduce((sum, item) => sum + item.netPct, 0) / recentNet.length) * 100) / 100
+    : null;
+  entry.recent_net_win_rate = recentNet.length > 0
+    ? Math.round((recentNet.filter((item) => item.netPct > 0).length / recentNet.length) * 10000) / 100
+    : null;
+
+  const latest = entry.deploys.at(-1);
+  if (latest) {
+    const latestNetPct = cleanNetPnlPct(latest);
+    entry.last_outcome = isLowYieldCloseReason(latest.close_reason)
+      ? "low_yield"
+      : (latestNetPct ?? Number(latest.pnl_pct ?? 0)) > 0 ? "profit" : "loss";
+  }
+}
+
 function setPoolCooldown(entry, hours, reason) {
   const cooldownUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
   entry.cooldown_until = cooldownUntil;
@@ -193,23 +244,7 @@ export function recordPoolDeploy(poolAddress, deployData) {
   entry.deploys.push(deploy);
   entry.total_deploys = entry.deploys.length;
   entry.last_deployed_at = deploy.closed_at;
-  entry.last_outcome = (deploy.pnl_pct ?? 0) >= 0 ? "profit" : "loss";
-
-  // Recompute aggregates
-  const withPnl = entry.deploys.filter((d) => d.pnl_pct != null);
-  if (withPnl.length > 0) {
-    entry.avg_pnl_pct = Math.round(
-      (withPnl.reduce((s, d) => s + d.pnl_pct, 0) / withPnl.length) * 100
-    ) / 100;
-    entry.win_rate = Math.round(
-      (withPnl.filter((d) => d.pnl_pct >= 0).length / withPnl.length) * 100
-    ) / 100;
-  }
-  const adjusted = withPnl.filter((d) => !isAdjustedWinRateExcludedReason(d.close_reason));
-  entry.adjusted_win_rate_sample_count = adjusted.length;
-  entry.adjusted_win_rate = adjusted.length > 0
-    ? Math.round((adjusted.filter((d) => d.pnl_pct >= 0).length / adjusted.length) * 10000) / 100
-    : 0;
+  recomputeAggregates(entry);
 
   if (deployData.base_mint && !entry.base_mint) {
     entry.base_mint = deployData.base_mint;
@@ -293,6 +328,7 @@ export function updatePoolDeploySolMetrics(poolAddress, position, metrics = {}) 
   for (const [key, value] of Object.entries(metrics)) {
     if (value !== undefined) deploy[key] = value;
   }
+  recomputeAggregates(entry);
   save(db);
   log("pool-memory", `Updated final SOL metrics for ${entry.name} (${position.slice(0, 8)})`);
   return true;
@@ -388,6 +424,9 @@ export function getPoolMemory({ pool_address }) {
     win_rate: entry.win_rate,
     adjusted_win_rate: entry.adjusted_win_rate ?? 0,
     adjusted_win_rate_sample_count: entry.adjusted_win_rate_sample_count ?? 0,
+    recent_net_avg_pct: entry.recent_net_avg_pct ?? null,
+    recent_net_win_rate: entry.recent_net_win_rate ?? null,
+    recent_net_sample_count: entry.recent_net_sample_count ?? 0,
     last_deployed_at: entry.last_deployed_at,
     last_outcome: entry.last_outcome,
     cooldown_until: entry.cooldown_until || null,
@@ -460,7 +499,10 @@ export function recallForPool(poolAddress) {
 
   // Deploy history summary
   if (entry.total_deploys > 0) {
-    lines.push(`POOL MEMORY [${entry.name}]: ${entry.total_deploys} past deploy(s), avg PnL ${entry.avg_pnl_pct}%, win rate ${entry.win_rate}%, last outcome: ${entry.last_outcome}`);
+    const recentNet = entry.recent_net_sample_count > 0
+      ? `, recent clean net avg ${entry.recent_net_avg_pct}% / win ${entry.recent_net_win_rate}% (${entry.recent_net_sample_count} samples)`
+      : ", recent clean net unavailable";
+    lines.push(`POOL MEMORY [${entry.name}]: ${entry.total_deploys} past deploy(s), legacy gross avg ${entry.avg_pnl_pct}% / win ${entry.win_rate}%${recentNet}, last outcome: ${entry.last_outcome}`);
   }
 
   if (entry.cooldown_until && new Date(entry.cooldown_until) > new Date()) {

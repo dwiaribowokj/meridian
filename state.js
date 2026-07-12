@@ -423,6 +423,15 @@ function configNumber(value, fallback) {
   return n == null ? fallback : n;
 }
 
+function costAwareProfitFloor(mgmtConfig) {
+  if (mgmtConfig.costAwareTakeProfitEnabled === false) return 0;
+  return Math.max(
+    0,
+    configNumber(mgmtConfig.estimatedRoundTripCostPct, 1.0) +
+      configNumber(mgmtConfig.minNetProfitPct, 0.25),
+  );
+}
+
 function positiveNumber(value) {
   const n = finiteNumber(value);
   return n != null && n > 0 ? n : null;
@@ -609,11 +618,15 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   // ── Profit protection / retrace exits ──────────────────────────
   if (!pnl_pct_suspicious && currentPnlPct != null) {
     const peakPnlPct = configNumber(pos.peak_pnl_pct, 0);
+    const profitFloorPct = costAwareProfitFloor(mgmtConfig);
 
     if (mgmtConfig.microProfitProtectEnabled !== false) {
       const microPeakTriggerPct = configNumber(mgmtConfig.microProfitPeakTriggerPct, 0.5);
       const microRetracePct = configNumber(mgmtConfig.microProfitRetracePct, 45);
-      const microMinCurrentPct = configNumber(mgmtConfig.microProfitMinCurrentPct, 0.05);
+      const microMinCurrentPct = Math.max(
+        configNumber(mgmtConfig.microProfitMinCurrentPct, 0.05),
+        profitFloorPct,
+      );
       const microMinAgeMinutes = configNumber(mgmtConfig.microProfitMinAgeMinutes, 8);
       if (
         peakPnlPct >= microPeakTriggerPct &&
@@ -633,7 +646,10 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     if (mgmtConfig.peakDecayCloseEnabled !== false) {
       const peakDecayMinPeakPct = configNumber(mgmtConfig.peakDecayMinPeakPct, 0.4);
       const peakDecayMinDropPct = configNumber(mgmtConfig.peakDecayMinDropPct, 0.25);
-      const peakDecayMinCurrentPct = configNumber(mgmtConfig.peakDecayMinCurrentPct, 0.02);
+      const peakDecayMinCurrentPct = Math.max(
+        configNumber(mgmtConfig.peakDecayMinCurrentPct, 0.02),
+        profitFloorPct,
+      );
       const peakDecayMinutes = configNumber(mgmtConfig.peakDecayMinutes, 12);
       const peakDecayMaxFeePerTvl24h = configNumber(
         mgmtConfig.peakDecayMaxFeePerTvl24h,
@@ -659,7 +675,10 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
 
     if (mgmtConfig.profitStallCloseEnabled !== false) {
       const profitStallMinPeakPct = configNumber(mgmtConfig.profitStallMinPeakPct, 0.55);
-      const profitStallMinCurrentPct = configNumber(mgmtConfig.profitStallMinCurrentPct, 0.35);
+      const profitStallMinCurrentPct = Math.max(
+        configNumber(mgmtConfig.profitStallMinCurrentPct, 0.35),
+        profitFloorPct,
+      );
       const profitStallMinutes = configNumber(mgmtConfig.profitStallMinutes, 6);
       const profitStallMaxFeePerTvl24h = configNumber(
         mgmtConfig.profitStallMaxFeePerTvl24h,
