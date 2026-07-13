@@ -673,7 +673,7 @@ export async function runScreeningCycle({ silent = false, fillSlots = true } = {
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}${warningText}`,
         pvpLine,
-        `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
+        `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : " (neutral; judge live fundamentals)"}`,
         activeBin != null ? `  active_bin: ${activeBin}` : null,
         priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
         indicatorContext ? `  ${indicatorContext}` : null,
@@ -715,6 +715,8 @@ ${candidateBlocks.join("\n\n")}
 STEPS:
 1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
 2. Pick the best candidate based on narrative quality, smart wallets, pool metrics, audit warnings, and indicator context. Indicator/candle context is advisory: strong metrics can override a weak signal, but do not deploy into clearly bearish or stale momentum. Treat HIGH_SINGLE_OWNERSHIP, high top10 concentration, and unconfirmed indicator context as serious negatives that require exceptional live fee/volume strength to override.
+   Smart wallets are a confidence bonus only. Zero smart wallets is neutral and must never be used as a rejection reason by itself.
+   Pool memory policy: an ACTIVE cooldown is a hard block. Once cooldown is inactive, old low-yield/OOR history is advisory, not a permanent veto. Prefer recent clean-net statistics over legacy gross history, and allow strong current fee/TVL, volume, and healthy momentum to override expired history.
    Reject any pool whose quote/token_y is not SOL; this bot deposits single-side SOL via amount_y and cannot deploy into USDC/USDT quote pools.
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
    bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
@@ -771,6 +773,7 @@ STEPS:
 IMPORTANT:
 - Keep the whole report compact and highly scannable for Telegram.
       `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 2048, {
+        allowNoToolFinal: true,
         onToolStart: async ({ name }) => {
           if (name === "deploy_position") deployAttempted = true;
           await liveMessage?.toolStart(name);
@@ -784,20 +787,33 @@ IMPORTANT:
           await liveMessage?.toolFinish(name, result, success);
         },
       });
-    screenReport = content;
-    if (/⛔\s*NO DEPLOY/i.test(content)) {
+    const claimsUnexecutedDeploy = /🚀\s*DEPLOYED/i.test(content) && !deploySucceeded;
+    screenReport = claimsUnexecutedDeploy
+      ? [
+          "⛔ NO DEPLOY",
+          "",
+          "Cycle finished with no executed entry.",
+          "",
+          "WHY SKIPPED",
+          "The model described a deployment without a successful deploy_position result; the claim was rejected.",
+        ].join("\n")
+      : content;
+    if (claimsUnexecutedDeploy) {
+      log("agent_warn", "Rejected screening report that claimed DEPLOYED without a successful deploy_position result");
+    }
+    if (/⛔\s*NO DEPLOY/i.test(screenReport)) {
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
         summary: "LLM chose no deploy",
-        reason: stripThink(content).slice(0, 500),
+        reason: stripThink(screenReport).slice(0, 500),
       });
     } else if (!deploySucceeded) {
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
         summary: deployAttempted ? "Deploy attempt did not succeed" : "No successful deploy in screening cycle",
-        reason: stripThink(content).slice(0, 500),
+        reason: stripThink(screenReport).slice(0, 500),
       });
     }
 

@@ -114,6 +114,15 @@ function shouldRequireRealToolUse(goal, agentType, interactive = false) {
   return interactive && LIVE_DATA_TOOL_INTENTS.test(goal);
 }
 
+export function isAllowedNoToolFinal(content, allowNoToolFinal = false) {
+  return allowNoToolFinal === true && /⛔\s*NO DEPLOY/i.test(String(content || ""));
+}
+
+export function shouldForceInitialToolChoice(goal, mustUseRealTool, allowNoToolFinal = false, step = 0) {
+  const actionIntent = /\b(deploy|open|add liquidity|close|exit|withdraw|claim|swap|block|unblock)\b/i;
+  return step === 0 && allowNoToolFinal !== true && (actionIntent.test(goal) || mustUseRealTool);
+}
+
 function buildMessages(systemPrompt, sessionHistory, goal, providerMode = "system") {
   if (providerMode === "user_embedded") {
     return [
@@ -155,7 +164,12 @@ function isThinkingModeToolChoiceError(error) {
  * @returns {string} - The agent's final text response
  */
 export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHistory = [], agentType = "GENERAL", model = null, maxOutputTokens = null, options = {}) {
-  const { interactive = false, onToolStart = null, onToolFinish = null } = options;
+  const {
+    interactive = false,
+    onToolStart = null,
+    onToolFinish = null,
+    allowNoToolFinal = false,
+  } = options;
   // Build dynamic system prompt with current portfolio state
   const [portfolio, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
   const stateSummary = getStateSummary();
@@ -199,8 +213,9 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       let response;
       let usedModel = activeModel;
       // Force a tool call on step 0 for action intents — prevents the model from inventing deploy/close outcomes
-      const ACTION_INTENTS = /\b(deploy|open|add liquidity|close|exit|withdraw|claim|swap|block|unblock)\b/i;
-      let toolChoice = (step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
+      let toolChoice = shouldForceInitialToolChoice(goal, mustUseRealTool, allowNoToolFinal, step)
+        ? "required"
+        : "auto";
 
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
@@ -287,7 +302,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           log("agent", "Empty response, retrying...");
           continue;
         }
-        if (mustUseRealTool && !sawToolCall) {
+        if (mustUseRealTool && !sawToolCall && !isAllowedNoToolFinal(msg.content, allowNoToolFinal)) {
           noToolRetryCount += 1;
           messages.pop();
           log("agent", `Rejected no-tool final answer (${noToolRetryCount}/2) for tool-required request`);

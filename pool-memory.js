@@ -125,6 +125,15 @@ export function recomputeAggregates(entry) {
   }
 }
 
+export function getPoolMemoryPolicy(entry, now = Date.now()) {
+  const activePoolCooldown = entry?.cooldown_until && Date.parse(entry.cooldown_until) > now;
+  const activeTokenCooldown = entry?.base_mint_cooldown_until && Date.parse(entry.base_mint_cooldown_until) > now;
+  if (activePoolCooldown || activeTokenCooldown) {
+    return "MEMORY POLICY: active cooldown is a hard block.";
+  }
+  return "MEMORY POLICY: no active cooldown; historical low-yield/OOR outcomes are advisory only. Judge the new entry on current clean-net evidence, fee/TVL, volume, and momentum.";
+}
+
 function setPoolCooldown(entry, hours, reason) {
   const cooldownUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
   entry.cooldown_until = cooldownUntil;
@@ -503,6 +512,10 @@ export function recallForPool(poolAddress) {
       ? `, recent clean net avg ${entry.recent_net_avg_pct}% / win ${entry.recent_net_win_rate}% (${entry.recent_net_sample_count} samples)`
       : ", recent clean net unavailable";
     lines.push(`POOL MEMORY [${entry.name}]: ${entry.total_deploys} past deploy(s), legacy gross avg ${entry.avg_pnl_pct}% / win ${entry.win_rate}%${recentNet}, last outcome: ${entry.last_outcome}`);
+    if (entry.last_deployed_at) {
+      const ageHours = Math.max(0, (Date.now() - Date.parse(entry.last_deployed_at)) / 3_600_000);
+      if (Number.isFinite(ageHours)) lines.push(`MEMORY AGE: last deploy closed ${ageHours.toFixed(1)}h ago (${entry.last_deployed_at})`);
+    }
   }
 
   if (entry.cooldown_until && new Date(entry.cooldown_until) > new Date()) {
@@ -513,6 +526,8 @@ export function recallForPool(poolAddress) {
     lines.push(`TOKEN COOLDOWN: active until ${entry.base_mint_cooldown_until}${entry.base_mint_cooldown_reason ? ` (${entry.base_mint_cooldown_reason})` : ""}`);
   }
 
+  lines.push(getPoolMemoryPolicy(entry));
+
   // Recent snapshot trend (last 6 = ~30min)
   const snaps = (entry.snapshots || []).slice(-6);
   if (snaps.length >= 2) {
@@ -522,7 +537,14 @@ export function recallForPool(poolAddress) {
       ? (last.pnl_pct - first.pnl_pct).toFixed(2)
       : null;
     const oorCount = snaps.filter(s => s.in_range === false).length;
-    lines.push(`RECENT TREND: PnL drift ${pnlTrend !== null ? (pnlTrend >= 0 ? "+" : "") + pnlTrend + "%" : "unknown"} over last ${snaps.length} cycles, OOR in ${oorCount}/${snaps.length} cycles`);
+    const lastSnapshotAt = Date.parse(last.ts);
+    const snapshotAgeHours = Number.isFinite(lastSnapshotAt)
+      ? Math.max(0, (Date.now() - lastSnapshotAt) / 3_600_000)
+      : null;
+    const trendLabel = snapshotAgeHours != null && snapshotAgeHours > 6
+      ? `LAST POSITION TREND (historical, ${snapshotAgeHours.toFixed(1)}h old)`
+      : "RECENT POSITION TREND";
+    lines.push(`${trendLabel}: PnL drift ${pnlTrend !== null ? (pnlTrend >= 0 ? "+" : "") + pnlTrend + "%" : "unknown"} over last ${snaps.length} cycles, OOR in ${oorCount}/${snaps.length} cycles`);
   }
 
   // Notes
