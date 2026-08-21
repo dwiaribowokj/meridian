@@ -89,10 +89,10 @@ Autonomous DLMM liquidity provider agent for Meteora pools on Solana.
 | `prompt.js` | 176 | `buildSystemPrompt(agentType, …)`. Three role-specific prompts. MANAGER is intentionally lean (positions pre-loaded into goal). SCREENER gets bins_below formula. |
 | **Tools layer** | | |
 | `tools/definitions.js` | 1124 | OpenAI-format tool schemas. **Source of truth for what the LLM sees.** All 40+ tool names listed. |
-| `tools/executor.js` | 844 | `executeTool(name, args)`. Pre-flight safety checks for `PROTECTED_TOOLS = {deploy, claim, close, swap, self_update}`. Validates pool thresholds via fresh pool discovery call before deploy. Post-tool side-effects: telegram notifications, pool-memory auto-annotation on `low yield` close, auto-swap base→SOL on close. |
+| `tools/executor.js` | 844 | `executeTool(name, args)`. Pre-flight safety checks for `PROTECTED_TOOLS = {deploy, claim, close, swap, self_update}`. Validates pool thresholds via fresh pool discovery call before deploy. Post-tool side-effects include Telegram notifications and pool-memory annotation on `low yield` close; close/claim never trigger wallet-wide swaps. |
 | `tools/dlmm.js` | huge | Meteora DLMM SDK wrapper. **Lazy-loads** `@meteora-ag/dlmm` to avoid CJS-import-time crash in DRY_RUN/test. Pool cache (5 min), metadata cache (15 min), positions cache (5 min TTL + inflight dedup). `deployPosition`, `getMyPositions`, `getPositionPnl`, `getActiveBin`, `closePosition`, `claimFees`, `searchPools`, `getWalletPositions`, `addLiquidity`, `withdrawLiquidity`. Also has relay-mode (zap-in via LPAgent) and wide-range path (multi-tx `createExtendedEmptyPosition` + `addLiquidityByStrategyChunkable` for >69 bin ranges). Asserts Meteora bin-array initialization rent never charged. |
 | `tools/screening.js` | 862 | `discoverPools`, `getTopCandidates` (hard filter + enrich + score), `getPoolDetail`. Scoring = `fee_tvl*1000 + organic*10 + vol/100 + holders/100`. Has Discord signal merge/only modes, PVP-rival detection. |
-| `tools/wallet.js` | 251 | `getWalletBalances` (Helius), `swapToken` (Jupiter Swap V2). `normalizeMint` collapses "SOL"/"native"/any So1-prefixed token to wrapped-SOL. Built-in referral: 50 bps to a fixed address (configurable). |
+| `tools/wallet.js` | 251 | `getWalletBalances` (Helius), `swapToken` (Jupiter Swap V2). `normalizeMint` maps only the explicit `SOL`/`native` aliases and the exact wrapped-SOL mint; similarly prefixed public keys are preserved. Direct swaps execute an already-bound raw `u64` amount, never a float conversion. Built-in referral: 50 bps to a fixed address (configurable). |
 | `tools/token.js` | 209 | `getTokenInfo` (Jupiter datapi), `getTokenHolders` (top 100 + filter pool-tagged), `getTokenNarrative` (Jupiter ChainInsight). Cross-references smart wallets from `smart-wallets.json`. |
 | `tools/study.js` | 152 | `studyTopLPers` → Agent Meridian `/top-lp` + `/study-top-lp`. Returns ranked LPer patterns (avg hold, win rate, preferred strategy). |
 | `tools/agent-meridian.js` | 110 | `agentMeridianJson(path, opts)` with retry/backoff. Default base = `https://api.agentmeridian.xyz/api`. |
@@ -131,10 +131,10 @@ Three roles (`agent.js:7-8`):
 | Role | Tool set (filter on `MANAGER_TOOLS` / `SCREENER_TOOLS` / `INTENT_TOOLS`) | Prompt source |
 |---|---|---|
 | `SCREENER` | `deploy_position, get_active_bin, get_top_candidates, check_smart_wallets_on_pool, get_token_holders, get_token_narrative, get_token_info, search_pools, get_pool_memory, get_wallet_balance, get_my_positions` | `prompt.js:104` — strict regime, "no hallucination" hard rule, must call `deploy_position` to claim success. |
-| `MANAGER` | `close_position, claim_fees, swap_token, get_position_pnl, get_my_positions, get_wallet_balance` | `prompt.js:18` — *mechanical rule-application*; positions + management config pre-loaded in goal. |
-| `GENERAL` | Intent-pattern matched (see `INTENT_PATTERNS` in `agent.js:51`). 17 intents: decisions, deploy, close, claim, swap, selfupdate, blocklist, config, balance, positions, strategy, screen, memory, smartwallet, study, performance, lessons. | `prompt.js:156` — full instruction-following. |
+| `MANAGER` | `close_position, claim_fees, reconcile_cleanup, get_position_pnl, get_my_positions, get_wallet_balance` | `prompt.js:18` — *mechanical rule-application*; positions + management config pre-loaded in goal. |
+| `GENERAL` | Intent-pattern matched (see `INTENT_PATTERNS` in `agent.js`). 18 intents: decisions, deploy, close, reconcile, claim, swap, selfupdate, blocklist, config, balance, positions, strategy, screen, memory, smartwallet, study, performance, lessons. | `prompt.js:156` — full instruction-following. |
 
-Some tools are explicitly **never** sent to GENERAL unless the goal matches an intent: `self_update`, `update_config`, all `add/remove_*` and `pin_/unpin_` tools, `clear_lessons`, `set_active_strategy` (see `GENERAL_INTENT_ONLY_TOOLS`).
+Some tools are explicitly **never** sent to GENERAL unless the goal matches an intent: `self_update`, `update_config`, all `add/remove_*` and `pin_/unpin_` tools, `clear_lessons`, `set_active_strategy` (see `GENERAL_INTENT_ONLY_TOOLS`). `swap_token` is exposed only for one whole-input direct command: optional `please`, `swap`/`convert`/`sell`/`exchange`, a positive plain decimal amount, and exact `SOL`, `USDC`, `USDT`, or base58 mint assets. Only terminal `.`/`!` punctuation is allowed. Clauses, conditions, explanations, retractions, connectors, newlines, unknown symbols, swap-shaped suffixes, invisible/punctuation-split spellings, and unsafe numeric precision are rejected. Confusable detection is denial-only: it removes all GENERAL tool authority but never normalizes text into an executable swap. For fail-closed unit authority, the source must resolve locally to SOL/USDC/USDT with fixed decimals 9/6/6 (an arbitrary exact base58 destination remains allowed); the original decimal text must yield a positive exact `u64` raw amount with no excess fractional unit. That raw amount is derived privately after provider argument validation, so the provider cannot select it and wallet execution never recomputes it through floating point. Dispatch uses only the resulting canonical mint arguments. The CLI uses the same original-text-to-raw binding for `meridian swap --from <SOL|USDC|USDT> --to <SOL|USDC|USDT|base58_mint> --amount <plain_decimal>` before invoking the executor.
 
 ### Adding a new tool
 
@@ -154,8 +154,8 @@ Some tools are explicitly **never** sent to GENERAL unless the goal matches an i
 - **No-tool-loop guard**: if `mustUseRealTool` is true (action intents, `MUTATING_TOOL_INTENTS` regex) and the LLM responds with text only, we inject a reminder; second failure returns an error message.
 - **Once-per-session tool locks**:
   - `ONCE_PER_SESSION = { deploy_position, swap_token, close_position }` — blocked on second call regardless of success.
-  - `NO_RETRY_TOOLS = { deploy_position }` — locks on first attempt even if it failed.
-  - For `swap_token` / `close_position`, locks only on `result.success === true` so a genuine failure can be retried.
+  - `NO_RETRY_TOOLS = { deploy_position, swap_token }` — locks before the first execution attempt, regardless of result or exception. A failed or ambiguous direct swap is never retried by the provider in the same `agentLoop` session; a new explicit command starts a new session.
+  - `close_position` locks on verified success; its separate retry policy does not apply to swaps.
 - **On every tool call**: `logAction({tool, args, result, duration_ms, success})` writes the audit JSONL.
 
 ---
@@ -241,11 +241,10 @@ manage cycle (every N min)
                  ├─ if performance.length % 5 == 0 → evolveThresholds + recalculateWeights
                  └─ push HiveMind event (fire-and-forget)
 
-auto-swap on close (executor.js:610)
-   ├─ only if !skip_swap && result.base_mint
-   ├─ get wallet balance, find base token
-   ├─ if usd >= 0.10 → swapToken back to SOL
-   └─ result.auto_swapped = true + auto_swap_note (so LLM doesn't double-swap)
+post-close/claim cleanup
+   ├─ no wallet-wide token swap is submitted automatically
+   ├─ reconcile_cleanup previews one closed lifecycle's scoped plan
+   └─ execution requires a separately confirmed operator capability
 ```
 
 **OOR detection**: `getMyPositions` calls `markOutOfRange` / `markInRange` for every position every cycle. The first time we see OOR, `out_of_range_since` is set; `minutesOutOfRange` is the diff.
@@ -292,7 +291,7 @@ All persistent files are loaded/saved on each call — no in-memory caching laye
 |---|---|---|
 | `risk` | `maxPositions`, `maxDeployAmount` | 3, 50 |
 | `screening` | `excludeHighSupplyConcentration`, `minFeeActiveTvlRatio`, `minTvl`, `maxTvl`, `minVolume`, `minOrganic`, `minQuoteOrganic`, `minHolders`, `minMcap`, `maxMcap`, `minBinStep`, `maxBinStep`, `timeframe`, `category`, `minTokenFeesSol`, `useDiscordSignals`, `discordSignalMode`, `avoidPvpSymbols`, `blockPvpSymbols`, `maxBotHoldersPct`, `maxTop10Pct`, `allowedLaunchpads`, `blockedLaunchpads`, `minTokenAgeHours`, `maxTokenAgeHours` | see `user-config.example.json` |
-| `management` | `minClaimAmount`, `autoSwapAfterClaim`, `outOfRangeBinsToClose`, `outOfRangeWaitMinutes`, `oorCooldownTriggerCount`, `oorCooldownHours`, `repeatDeployCooldownEnabled`, `repeatDeployCooldownTriggerCount`, `repeatDeployCooldownHours`, `repeatDeployCooldownScope`, `repeatDeployCooldownMinFeeEarnedPct`, `minVolumeToRebalance`, `stopLossPct`, `takeProfitPct`, `minFeePerTvl24h`, `minAgeBeforeYieldCheck`, `minSolToOpen`, `deployAmountSol`, `gasReserve`, `positionSizePct`, `trailingTakeProfit`, `trailingTriggerPct`, `trailingDropPct`, `pnlSanityMaxDiffPct`, `solMode` | 5, false, 10, 30, 3, 12, true, 3, 12, "token", 0, 1000, -50, 5, 7, 60, 0.55, 0.5, 0.2, 0.35, true, 3, 1.5, 5, false |
+| `management` | `minClaimAmount`, `outOfRangeBinsToClose`, `outOfRangeWaitMinutes`, `oorCooldownTriggerCount`, `oorCooldownHours`, `repeatDeployCooldownEnabled`, `repeatDeployCooldownTriggerCount`, `repeatDeployCooldownHours`, `repeatDeployCooldownScope`, `repeatDeployCooldownMinFeeEarnedPct`, `minVolumeToRebalance`, `stopLossPct`, `takeProfitPct`, `minFeePerTvl24h`, `minAgeBeforeYieldCheck`, `minSolToOpen`, `deployAmountSol`, `gasReserve`, `positionSizePct`, `trailingTakeProfit`, `trailingTriggerPct`, `trailingDropPct`, `pnlSanityMaxDiffPct`, `solMode` | 5, 10, 30, 3, 12, true, 3, 12, "token", 0, 1000, -50, 5, 7, 60, 0.55, 0.5, 0.2, 0.35, true, 3, 1.5, 5, false |
 | `strategy` | `strategy`, `minBinsBelow`, `maxBinsBelow`, `defaultBinsBelow` | bid_ask, 35, 69, 69 |
 | `schedule` | `managementIntervalMin`, `screeningIntervalMin`, `healthCheckIntervalMin` | 10, 30, 60 |
 | `llm` | `temperature`, `maxTokens`, `maxSteps`, `managementModel`, `screeningModel`, `generalModel` | 0.373, 4096, 20, healer-alpha, hunter-alpha, healer-alpha |
@@ -430,6 +429,6 @@ When scheduling work, follow the **`_busy` flag + cooldown** pattern. `_manageme
 - Changing safety rules → `tools/executor.js#runSafetyChecks` and `index.js#getDeterministicCloseRule`.
 - Adding a new persistent state file → copy `state.js` or `pool-memory.js`. Add a getter to `index.js` system-prompt section if the LLM needs to see it.
 - Changing the LLM contract → `prompt.js` (buildSystemPrompt) and `agent.js` (INTENT_TOOLS + role sets + safety guards).
-- Changing deploy/close behavior → `tools/dlmm.js` (the SDK wrapper) and `tools/executor.js` (the post-tool side effects + Telegram notify + auto-swap).
+- Changing deploy/close behavior → `tools/dlmm.js` (the SDK wrapper) and `tools/executor.js` (the post-tool side effects and Telegram notifications; no automatic wallet-wide swaps).
 - Discord listener issues → `discord-listener/pre-checks.js`.
 - HiveMind protocol issues → `hivemind.js` (push side) and `lessons.js#getLessonsForPrompt` (pull side injection).

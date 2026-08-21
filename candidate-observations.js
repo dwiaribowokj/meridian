@@ -1,5 +1,6 @@
 import fs from "fs";
 import { repoPath } from "./repo-root.js";
+import { evaluatePriceStabilityObservations } from "./risk-policy.js";
 
 const OBSERVATIONS_FILE = process.env.CANDIDATE_OBSERVATIONS_PATH || repoPath("candidate-observations.json");
 
@@ -34,17 +35,30 @@ function settings(screening = {}) {
     minSpacingMs: Math.max(0, Number(screening.candidateConfirmationMinSpacingMinutes ?? 2)) * 60_000,
     minFeeRetentionPct: Math.max(0, Number(screening.candidateMinFeeRetentionPct ?? 70)),
     minVolumeRetentionPct: Math.max(0, Number(screening.candidateMinVolumeRetentionPct ?? 70)),
+    priceStabilityEnabled: screening.candidatePriceStabilityEnabled === true,
+    maxPriceDrawdownPct: Math.max(0.1, Number(screening.candidateMaxPriceDrawdownPct ?? 1.5)),
+    maxDownsideBinDelta: Math.max(0.25, Number(screening.candidateMaxDownsideBinDelta ?? 2)),
   };
 }
 
 function metricSnapshot(metrics, now) {
-  return {
+  const snapshot = {
     feeActiveTvlRatio: finiteNumber(metrics?.feeActiveTvlRatio),
     volume: finiteNumber(metrics?.volume),
+    price: finiteNumber(metrics?.price),
+    binStep: finiteNumber(metrics?.binStep),
     count: 1,
     observedAt: now,
     ready: false,
   };
+  snapshot.observations = [{
+    observedAt: now,
+    feeActiveTvlRatio: snapshot.feeActiveTvlRatio,
+    volume: snapshot.volume,
+    price: snapshot.price,
+    binStep: snapshot.binStep,
+  }];
+  return snapshot;
 }
 
 function retentionPct(current, previous) {
@@ -67,7 +81,12 @@ export function observeCandidateStability(poolAddress, metrics, screening = {}, 
   if (!poolAddress) return { pass: false, count: 0, target: cfg.target, reason: "Candidate pool address missing." };
 
   const current = metricSnapshot(metrics, now);
-  if (current.feeActiveTvlRatio == null || current.volume == null) {
+  if (
+    current.feeActiveTvlRatio == null || current.volume == null ||
+    (cfg.priceStabilityEnabled && (
+      current.price == null || current.price <= 0 || current.binStep == null || current.binStep <= 0
+    ))
+  ) {
     return { pass: false, count: 0, target: cfg.target, reason: "Candidate stability metrics are incomplete." };
   }
 
@@ -86,6 +105,7 @@ export function observeCandidateStability(poolAddress, metrics, screening = {}, 
       pass: previous.ready === true,
       count: Number(previous.count ?? 1),
       target: cfg.target,
+      observations: Array.isArray(previous.observations) ? previous.observations : [],
       reason: previous.ready === true
         ? `Candidate stability confirmed ${previous.count}/${cfg.target}.`
         : `Candidate observation is too soon; waiting ${Math.ceil((cfg.minSpacingMs - (now - previous.observedAt)) / 1000)}s.`,
@@ -105,7 +125,37 @@ export function observeCandidateStability(poolAddress, metrics, screening = {}, 
 
   const count = Math.min(cfg.target, Math.max(1, Number(previous.count ?? 1)) + 1);
   const ready = count >= cfg.target;
-  data.pools[poolAddress] = { ...current, count, ready };
+  const priorObservations = Array.isArray(previous.observations)
+    ? previous.observations
+    : [{
+        observedAt: previous.observedAt,
+        feeActiveTvlRatio: previous.feeActiveTvlRatio,
+        volume: previous.volume,
+        price: previous.price,
+        binStep: previous.binStep,
+      }];
+  const observations = [...priorObservations, ...current.observations]
+    .filter((entry) => entry?.observedAt != null)
+    .slice(-cfg.target);
+  const priceStability = evaluatePriceStabilityObservations(observations, {
+    required: cfg.priceStabilityEnabled,
+    maxPriceDrawdownPct: cfg.maxPriceDrawdownPct,
+    maxDownsideBinDelta: cfg.maxDownsideBinDelta,
+  });
+  if (!priceStability.eligible) {
+    data.pools[poolAddress] = current;
+    save(data);
+    return {
+      pass: false,
+      count: 1,
+      target: cfg.target,
+      feeRetentionPct,
+      volumeRetentionPct,
+      priceStability,
+      reason: `Candidate price stability reset: ${priceStability.reasons.join(", ")}.`,
+    };
+  }
+  data.pools[poolAddress] = { ...current, count, ready, observations };
   save(data);
   return {
     pass: ready,
@@ -113,6 +163,8 @@ export function observeCandidateStability(poolAddress, metrics, screening = {}, 
     target: cfg.target,
     feeRetentionPct,
     volumeRetentionPct,
+    priceStability,
+    observations,
     reason: ready
       ? `Candidate stability confirmed ${count}/${cfg.target}.`
       : `Candidate stability ${count}/${cfg.target}; waiting for more observations.`,
@@ -135,9 +187,17 @@ export function validateCandidateStability(poolAddress, metrics, screening = {},
 
   const currentFee = finiteNumber(metrics?.feeActiveTvlRatio);
   const currentVolume = finiteNumber(metrics?.volume);
+  const currentPrice = finiteNumber(metrics?.price);
+  const currentBinStep = finiteNumber(metrics?.binStep);
   const feeRetentionPct = retentionPct(currentFee, finiteNumber(entry.feeActiveTvlRatio));
   const volumeRetentionPct = retentionPct(currentVolume, finiteNumber(entry.volume));
-  if (currentFee == null || currentVolume == null || feeRetentionPct < cfg.minFeeRetentionPct || volumeRetentionPct < cfg.minVolumeRetentionPct) {
+  if (
+    currentFee == null || currentVolume == null ||
+    (cfg.priceStabilityEnabled && (
+      currentPrice == null || currentPrice <= 0 || currentBinStep == null || currentBinStep <= 0
+    )) ||
+    feeRetentionPct < cfg.minFeeRetentionPct || volumeRetentionPct < cfg.minVolumeRetentionPct
+  ) {
     data.pools[poolAddress] = metricSnapshot(metrics, now);
     save(data);
     return {
@@ -145,7 +205,46 @@ export function validateCandidateStability(poolAddress, metrics, screening = {},
       reason: `Candidate weakened during deploy preflight (fee ${feeRetentionPct.toFixed(1)}%, volume ${volumeRetentionPct.toFixed(1)}%); stability reset.`,
     };
   }
-  return { pass: true, feeRetentionPct, volumeRetentionPct };
+  const qualifiedObservations = Array.isArray(entry.observations)
+    ? entry.observations
+    : [{
+        observedAt: entry.observedAt,
+        feeActiveTvlRatio: entry.feeActiveTvlRatio,
+        volume: entry.volume,
+        price: entry.price,
+        binStep: entry.binStep,
+      }];
+  const validationObservations = [
+    ...qualifiedObservations,
+    {
+      observedAt: now,
+      feeActiveTvlRatio: currentFee,
+      volume: currentVolume,
+      price: currentPrice,
+      binStep: currentBinStep,
+    },
+  ];
+  const priceStability = evaluatePriceStabilityObservations(validationObservations, {
+    required: cfg.priceStabilityEnabled,
+    maxPriceDrawdownPct: cfg.maxPriceDrawdownPct,
+    maxDownsideBinDelta: cfg.maxDownsideBinDelta,
+  });
+  if (!priceStability.eligible) {
+    data.pools[poolAddress] = metricSnapshot(metrics, now);
+    save(data);
+    return {
+      pass: false,
+      priceStability,
+      reason: `Candidate weakened during deploy preflight (${priceStability.reasons.join(", ")}); stability reset.`,
+    };
+  }
+  return {
+    pass: true,
+    feeRetentionPct,
+    volumeRetentionPct,
+    priceStability,
+    observations: qualifiedObservations,
+  };
 }
 
 export function clearCandidateObservation(poolAddress) {

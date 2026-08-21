@@ -288,16 +288,32 @@ WARNING: This executes a real on-chain transaction. Cannot be undone.`,
             type: "string",
             description: "The position public key to close"
           },
-          skip_swap: {
-            type: "boolean",
-            description: "Set to true if user explicitly wants to hold/keep the base token after closing. Default: false (auto-swaps base token back to SOL)."
-          },
           reason: {
             type: "string",
             description: "Why this position is being closed. Include the rule that triggered it, e.g. 'low yield', 'stop loss', 'trailing TP', 'OOR'. Used for pool memory."
           }
         },
         required: ["position_address"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "reconcile_cleanup",
+      description: `Preview the scoped economic-cleanup plan and reconciliation status for one closed position lifecycle.
+
+This model tool is preview-only and never submits cleanup transactions. An operator may execute a reviewed plan only through the separately confirmed Telegram command; close_position never runs cleanup automatically.`,
+      parameters: {
+        type: "object",
+        properties: {
+          position: {
+            type: "string",
+            description: "The closed position address whose lifecycle is being previewed."
+          }
+        },
+        required: ["position"]
       }
     }
   },
@@ -352,9 +368,8 @@ Use to check available capital before deploying positions.`,
     function: {
       name: "swap_token",
       description: `Swap tokens via Jupiter aggregator.
-Use when you need to rebalance wallet holdings, e.g.:
-- Convert claimed fee tokens back to SOL/USDC
-- Prepare token pair before deploying a position
+Use only for a direct, explicit user request that identifies the intended swap.
+It is never an automatic follow-up to closing or claiming a position.
 
 WARNING: This executes a real on-chain transaction.`,
       parameters: {
@@ -370,7 +385,7 @@ WARNING: This executes a real on-chain transaction.`,
           },
           amount: {
             type: "number",
-            description: "Amount of input token to swap (in human-readable units, not lamports)"
+            description: "Amount of input token to swap (in human-readable units, not lamports). The exact raw on-chain amount is derived privately from the canonical user command; never provide amount_raw."
           },
         },
         required: ["input_mint", "output_mint", "amount"]
@@ -390,13 +405,13 @@ Changes persist to user-config.json and take effect immediately — no restart n
 
 VALID KEYS (use EXACTLY these key names, nothing else):
 Screening: minFeeActiveTvlRatio, minTvl, maxTvl, minVolume, maxVolatility, minOrganic, minQuoteOrganic, minHolders, minMcap, maxMcap, minBinStep, maxBinStep, timeframe, category, minTokenFeesSol, excludeHighSupplyConcentration, allowedLaunchpads, blockedLaunchpads, extraSearchSymbols, extraSearchLimitPerSymbol, extraSearchOnlySolPools
-Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, oorCooldownTriggerCount, oorCooldownHours, repeatDeployCooldownEnabled, repeatDeployCooldownTriggerCount, repeatDeployCooldownHours, repeatDeployCooldownScope, repeatDeployCooldownMinFeeEarnedPct, badOutcomeCooldownEnabled, badOutcomeCooldownScope, lowYieldCooldownHours, stopLossCooldownHours, minVolumeToRebalance, stopLossPct, takeProfitPct, trailingTakeProfit, trailingTriggerPct, trailingDropPct, dynamicStopLossEnabled, dynamicStopBasePct, breakevenTriggerPct, breakevenStopPct, profitProtectTriggerPct, profitProtectStopPct, retraceCloseTriggerPct, retraceClosePct, dynamicStopMinAgeMinutes, microProfitProtectEnabled, microProfitPeakTriggerPct, microProfitRetracePct, microProfitMinCurrentPct, microProfitMinAgeMinutes, profitStallCloseEnabled, profitStallMinPeakPct, profitStallMinCurrentPct, profitStallMinutes, profitStallMaxFeePerTvl24h, peakDecayCloseEnabled, peakDecayMinPeakPct, peakDecayMinDropPct, peakDecayMinCurrentPct, peakDecayMinutes, peakDecayMaxFeePerTvl24h, deadPositionCheck1Minutes, deadPositionCheck1MaxPeakPct, deadPositionCheck1MaxCurrentPct, deadPositionCheck1MaxFeePerTvl24h, pnlSanityMaxDiffPct, pnlNewPositionOutlierMinutes, pnlNewPositionOutlierMaxPct, pnlOutlierMaxPct, pnlDivergenceGateMinPct, minSolToOpen, deployAmountSol, gasReserve, positionSizePct
+Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, oorCooldownTriggerCount, oorCooldownHours, shadowOutOfRangeCooldownHours, repeatDeployCooldownEnabled, repeatDeployCooldownTriggerCount, repeatDeployCooldownHours, repeatDeployCooldownScope, repeatDeployCooldownMinFeeEarnedPct, badOutcomeCooldownEnabled, badOutcomeCooldownScope, lowYieldCooldownHours, stopLossCooldownHours, minVolumeToRebalance, stopLossPct, takeProfitPct, trailingTakeProfit, trailingTriggerPct, trailingDropPct, dynamicStopLossEnabled, dynamicStopBasePct, breakevenTriggerPct, breakevenStopPct, profitProtectTriggerPct, profitProtectStopPct, retraceCloseTriggerPct, retraceClosePct, dynamicStopMinAgeMinutes, microProfitProtectEnabled, microProfitPeakTriggerPct, microProfitRetracePct, microProfitMinCurrentPct, microProfitMinAgeMinutes, profitStallCloseEnabled, profitStallMinPeakPct, profitStallMinCurrentPct, profitStallMinutes, profitStallMaxFeePerTvl24h, peakDecayCloseEnabled, peakDecayMinPeakPct, peakDecayMinDropPct, peakDecayMinCurrentPct, peakDecayMinutes, peakDecayMaxFeePerTvl24h, deadPositionCheck1Minutes, deadPositionCheck1MaxPeakPct, deadPositionCheck1MaxCurrentPct, deadPositionCheck1MaxFeePerTvl24h, pnlSanityMaxDiffPct, pnlNewPositionOutlierMinutes, pnlNewPositionOutlierMaxPct, pnlOutlierMaxPct, pnlDivergenceGateMinPct, pnlConfirmTicks, pnlProfitConfirmTicks, pnlStopConfirmTicks, minSolToOpen, deployAmountSol, gasReserve, positionSizePct
 Strategy: strategy, minBinsBelow, maxBinsBelow, defaultBinsBelow, multiLayerEnabled, multiLayerMode, multiLayerLayers, multiLayerMinLayerSol, multiLayerMinDeploySol, regimeStrategyEnabled, regimeLowVolMax, regimeHighVolMin, regimeLowVolStrategy, regimeMidVolStrategy, regimeHighVolStrategy
 Risk: maxPositions, maxDeployAmount
 Schedule: managementIntervalMin, screeningIntervalMin
 Models: managementModel, screeningModel, generalModel
 Strategy: strategy, minBinsBelow, maxBinsBelow, defaultBinsBelow (legacy binsBelow maps to maxBinsBelow), multiLayerEnabled, multiLayerMode, multiLayerLayers, multiLayerPrimaryStrategy, multiLayerSecondaryStrategy, multiLayerPrimaryPct, multiLayerSecondaryPct, multiLayerMinLayerSol, multiLayerMinSecondarySol
-Indicators: chartIndicatorsEnabled, indicatorEntryPreset, indicatorExitPreset, rsiLength, indicatorIntervals, indicatorCandles, rsiOversold, rsiOverbought, requireAllIntervals, indicatorHardFilter
+Indicators: chartIndicatorsEnabled, indicatorEntryPreset, indicatorExitPreset, rsiLength, indicatorIntervals, indicatorCandles, rsiOversold, rsiOverbought, entryRsiMax5m, entryRsiMax15m, entryRejectAboveUpperBand, requireAllIntervals, indicatorHardFilter
 
 Reason is optional but helpful — logged as a lesson when provided.`,
       parameters: {

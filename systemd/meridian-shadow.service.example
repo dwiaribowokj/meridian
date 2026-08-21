@@ -1,0 +1,22 @@
+[Unit]
+Description=Meridian persistent runtime
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Replace both placeholder paths before installing this unit.
+WorkingDirectory=/absolute/path/to/meridian
+ExecStart=/absolute/path/to/node /absolute/path/to/meridian/index.js
+Environment=NODE_ENV=production
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

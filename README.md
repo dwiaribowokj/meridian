@@ -12,7 +12,9 @@ Meridian runs continuous screening and management cycles, deploying capital into
 
 - **Screens pools** — scans Meteora DLMM pools against configurable thresholds (fee/TVL ratio, organic score, holder count, mcap, bin step) and surfaces high-quality opportunities
 - **Manages positions** — monitors, claims fees, and closes LP positions autonomously; decides to STAY, CLOSE, or REDEPLOY based on live data
-- **Learns from performance** — studies top LPers in target pools, saves structured lessons, and evolves screening thresholds based on closed position history
+- **Reconciles every trade** — records position-bound deploy/close receipts, converts only lifecycle-attributed residue, and settles authoritative SOL economics in an append-only ledger
+- **Fails closed at live boundaries** — locks canary sizing, serializes deploys, and latches a durable circuit breaker when accounting, lifecycle, or risk evidence is unsafe
+- **Maintains learning primitives** — supports lessons, performance history, and threshold evolution; automatic learning is frozen during the locked shadow/canary rollout
 - **Discord signals** — optional Discord listener watches LP Army channels for Solana token calls and queues them for screening
 - **Telegram chat** — full agent chat via Telegram, plus cycle reports and OOR alerts
 - **Claude Code integration** — run AI-powered screening and management directly from your terminal using Claude Code slash commands
@@ -25,8 +27,13 @@ Meridian runs a **ReAct agent loop** — each cycle the LLM reasons over live da
 
 | Agent | Default interval | Role |
 |---|---|---|
-| **Screening Agent** | Every 30 min | Pool screening — finds and deploys into the best candidate |
+| **Screening Agent** | Every 30 min (1 min in the locked rotation canary) | Pool screening — finds and deploys into the best candidate |
 | **Management Agent** | Every 10 min | Position management — evaluates each open position and acts |
+
+A separate PnL poller watches deterministic SL, TP, and OOR conditions between
+management cycles. In the live canary, deterministic admission and exit policy
+remain authoritative; the LLM can veto a candidate but cannot bypass a safety
+gate or enlarge the locked exposure.
 
 ### Agent harness
 
@@ -77,7 +84,7 @@ The wizard writes **both** files at the repo root:
 |---|---|
 | `WALLET_PRIVATE_KEY`, `OPENROUTER_API_KEY`, `RPC_URL`, `HELIUS_API_KEY` | Risk preset, deploy size, max positions |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_ALLOWED_USER_IDS` | Strategy, screening filters, exit rules, trailing TP |
-| `DRY_RUN` | Position sizing, cycle intervals, per-role LLM models, `solMode` |
+| `DRY_RUN` compatibility mirror, `EMERGENCY_STOP` | Rollout request (`dryRun`, `rolloutMode`), position sizing, cycle intervals, per-role LLM models, `solMode` |
 
 `TELEGRAM_CHAT_ID` only needs to live in `.env` — setup also copies it to `user-config.json` when provided. Takes about 2 minutes.
 
@@ -91,8 +98,9 @@ RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
 OPENROUTER_API_KEY=sk-or-...
 HELIUS_API_KEY=your_helius_key          # for wallet balance lookups
 TELEGRAM_BOT_TOKEN=123456:ABC...        # optional — for notifications + chat
-TELEGRAM_CHAT_ID=                       # auto-filled on first message
-DRY_RUN=true                            # set false for live trading
+TELEGRAM_CHAT_ID=your_explicit_chat_id  # inbound auto-registration is disabled
+DRY_RUN=true                            # compatibility/diagnostic mirror; user-config owns the rollout request
+EMERGENCY_STOP=                         # set exactly true only to force a safe dry-run startup
 ```
 
 > Never put your private key or API keys in `user-config.json` — use `.env` only. Both files are gitignored.
@@ -118,11 +126,60 @@ See [Config reference](#config-reference) below.
 ### 3. Run
 
 ```bash
-npm run dev    # dry run — no on-chain transactions
-npm start      # live mode
+npm run dev    # compatibility shortcut; still obeys the user-config rollout authority
+npm start      # starts the effective configured mode (not automatically live)
 ```
 
-On startup Meridian fetches your wallet balance, open positions, and top pool candidates, then begins autonomous cycles immediately.
+Use this explicit safe configuration before the first start:
+
+```json
+{
+  "dryRun": true,
+  "rolloutMode": "dry_run"
+}
+```
+
+`npm run dev` setting `DRY_RUN=true` does not override an already authorized
+canary; the environment value is diagnostic only. Conversely, `npm start` does
+not authorize live execution by itself. The runtime recomputes its effective
+mode from `user-config.json` and raw rollout evidence, then logs either
+`Effective mode: DRY RUN` or `Effective mode: LIVE CANARY`. When in doubt, set
+`EMERGENCY_STOP=true` before startup; only that exact environment value can
+force the rollout back to dry run.
+
+The only live stage currently authorized is a locked canary: exactly `0.20
+SOL`, at most one position, using strategy profile `rotation_live_v1`. A normal
+canary start requires accepted historical and shadow source evidence. The
+explicit `operatorLiveCanaryOverrideConfirmation` supported by
+`user-config.json` bypasses source-readiness gates only; it cannot enlarge the
+canary or bypass the ledger, cleanup, deploy guard, or circuit breaker. Inspect
+the effective decision with `/opsstatus` before funding the wallet.
+
+On startup Meridian fetches your wallet balance and open positions, runs
+management first so pending lifecycle cleanup can retry, and then starts
+screening.
+
+### Run with persistent user systemd
+
+For a host that must recover after reboot or a user-manager restart, install a
+persistent user unit rather than using `systemd-run` (transient units disappear
+when the user manager is recreated):
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp systemd/meridian-shadow.service.example ~/.config/systemd/user/meridian-shadow.service
+# Edit WorkingDirectory and ExecStart for this host before enabling the unit.
+${EDITOR:-vi} ~/.config/systemd/user/meridian-shadow.service
+systemctl --user daemon-reload
+systemctl --user enable --now meridian-shadow.service
+loginctl enable-linger "$USER"
+```
+
+The tracked example deliberately contains placeholder repository and Node
+paths. The installed `.service` is host-specific and ignored by Git so local
+paths or emergency RPC failovers cannot be published accidentally. It uses
+`Restart=always`, loads secrets through Meridian's normal `.env`/encrypted-env
+bootstrap, and does not copy wallet secrets into the unit file.
 
 ### Run with PM2 (VPS / always-on)
 
@@ -310,10 +367,18 @@ meridian token-narrative --mint <addr>
 meridian deploy --pool <addr> --amount <sol> [--bins-below 69] [--bins-above 0] [--strategy bid_ask|spot|curve] [--dry-run]
 meridian claim --position <addr>
 meridian close --position <addr> [--skip-swap] [--dry-run]
-meridian swap --from <mint> --to <mint> --amount <n> [--dry-run]
+meridian swap --from <SOL|USDC|USDT|base58_mint> --to <SOL|USDC|USDT|base58_mint> --amount <token_unit_decimal> [--dry-run]
 meridian add-liquidity --position <addr> --pool <addr> [--amount-x <n>] [--amount-y <n>] [--strategy spot]
 meridian withdraw-liquidity --position <addr> --pool <addr> [--bps 10000]
 ```
+
+For `swap`, `--amount` is always positive token-unit decimal text (including
+legacy forms such as `.5`, `1e-3`, `01`, and `1.`). Meridian validates and
+converts it internally without floating-point arithmetic using the source
+mint's authoritative decimals. Destinations may use an alias or exact base58
+mint. `close --skip-swap` remains accepted as a legacy no-op; close and claim
+never perform a wallet-wide follow-up swap. A post-close lifecycle cleanup may
+still convert residue to SOL, but only from position-attributed token accounts.
 
 **Agent cycles**
 
@@ -364,8 +429,60 @@ meridian balance
 
 | Flag | Effect |
 |---|---|
-| `--dry-run` | Skip all on-chain transactions |
+| `--dry-run` | Compatibility request only; for a guaranteed safe autonomous run, set `dryRun=true`, `rolloutMode=dry_run`, or boot with `EMERGENCY_STOP=true` |
 | `--silent` | Suppress Telegram notifications for this run |
+
+---
+
+## Live safety, lifecycle, and settlement
+
+Every submitted live operation is isolated by a durable operation lease and
+position-bound receipt evidence. A normal lifecycle progresses as follows:
+
+```text
+PENDING_DEPLOY → BASIS_PENDING → ACTIVE → CLOSING → CLEANUP_PENDING → SETTLED
+                         ↘ RECONCILIATION_REQUIRED ↗
+```
+
+- `ACTIVE` requires decoded deploy receipts and an authoritative cost basis.
+- A confirmed close enters `CLEANUP_PENDING`; close success alone is not final
+  PnL.
+- Automatic cleanup may swap or close only token accounts attributed to that
+  lifecycle. It never sweeps unrelated wallet balances.
+- Pending cleanup is retried automatically during management. It is visible in
+  `/opsstatus` and is not, by itself, a blanket ban on screening or another
+  otherwise-safe deploy.
+- `SETTLED` requires zero economic residue and reconciled wallet/component
+  equity within the configured lamport tolerance. Settlement PnL, rather than
+  the pre-close API estimate, is the authoritative result.
+
+The global live-canary deploy guard serializes the RPC position check and the
+entire deploy outcome, preventing two concurrent requests from both observing
+an empty slot. A retained or uncertain guard fails closed and is inspectable
+with `/canaryguard`.
+
+The circuit breaker is durable across restarts. With
+`circuitAutomaticResume=true`, recoverable economic and operational latches
+(`PROFIT_EXIT_BELOW_GLOBAL_FLOOR`, loss limits, canary drawdown, and consecutive
+operational failures) start a fresh risk epoch automatically after the
+configured cooldown. Recovery requires a fresh authoritative proof of RPC
+positions `0`, tracked positions `0`, all lifecycles `SETTLED`, no pending
+cleanup, and a free global deploy guard. Invalid cost basis, malformed data,
+reconciliation mismatches, lifecycle anomalies, retained operation guards, and
+breaker durability uncertainty remain fail-closed because the transaction
+outcome is not yet known; they are never converted into permissive state.
+
+Runtime records:
+
+| Record | Purpose |
+|---|---|
+| `trade-ledger.jsonl` | Append-only lifecycle receipts, valuations, transitions, and settlement economics |
+| `.meridian-lifecycle-operations/` | Per-operation journals and leases for deploy, close, claim, and cleanup |
+| `~/.meridian-breaker-runtime/circuit-breaker.json` | Private durable breaker latch and resume audit state |
+| `state.json` | Runtime position registry and paper/shadow observations |
+
+Do not hand-edit these files while the service is running. Use `/opsstatus`,
+`/cleanup`, `/breaker`, and `/canaryguard` for inspection and bounded recovery.
 
 ---
 
@@ -456,79 +573,132 @@ Meridian sends notifications automatically for:
 
 | Command | Action |
 |---|---|
-| `/positions` | List open positions with progress bar |
-| `/close <n>` | Close position by list index |
-| `/set <n> <note>` | Set a note on a position |
+| `/status` | Wallet, positions, effective rollout, breaker, and ledger summary |
+| `/opsstatus` | Rollout evidence, breaker, lifecycle counts, cleanup, and deploy-guard state without the wallet view |
+| `/positions`, `/pool <n>` | List positions or inspect one open position |
+| `/close <n>`, `/closeall` | Close one or all positions through the lifecycle-safe executor |
+| `/closecooldown <n>` | Close one position and cooldown its pool/token |
+| `/cleanup <position>` | Preview position-scoped economic cleanup without submitting a transaction |
+| `/cleanup execute <position> …` | Execute scoped cleanup; the bot returns the exact confirmation phrase required |
+| `/breaker` | Inspect the durable circuit-breaker latch and resume audit fields |
+| `/resumebreaker` | Open a trip-bound confirmation button that safely resumes the current breaker latch |
+| `/breaker resume …` | Manually resume an intact latch; does not itself submit a trade |
+| `/breaker repair …` | Repair uncertain breaker durability into a safe, still-latched state |
+| `/canaryguard` | Inspect the global live-canary deploy guard |
+| `/canaryguard reconcile <operation_id> …` | Reconcile and release a retained guard after fresh authoritative evidence |
+| `/screen`, `/candidates`, `/deploy <n>` | Refresh candidates, inspect the cache, or request a deterministic candidate deploy |
+| `/pause`, `/resume` | Stop or restart cron cycles without changing the durable breaker |
+| `/set <n> <note>` | Set a note or instruction on a position |
 
-You can also chat freely via Telegram using the same interface as the REPL. Only allowed user IDs can issue commands in groups.
+Mutation and recovery commands deliberately require explicit confirmation.
+For the breaker, `/resumebreaker` provides a one-tap confirmation button bound
+to the current trip, while the longer exact-text command remains available.
+`/resume` restarts cron scheduling, whereas breaker resume changes entry
+eligibility—these are intentionally separate controls.
+
+You can also chat freely via Telegram using the same interface as the REPL.
+Inbound polling continues while an earlier command is queued or waiting on an
+RPC/model provider, and financial commands are dispatched serially. Only
+allowed user IDs can issue commands in groups.
 
 ---
 
 ## Config reference
 
-All fields are optional — defaults shown. Edit `user-config.json`.
+Edit `user-config.json`; `user-config.example.json` is an opinionated sample,
+not a list of immutable defaults. The **base fallback** below is used when a
+field is absent and the rotation overlay is inactive. The effective live
+canary always uses the bounded rotation profile. The rotation columns show its
+defaults; most profile parameters are clamped to safe code-defined ranges,
+while `0.20 SOL` and one position are immutable. `/config` and `/opsstatus`
+show the effective runtime view.
 
 ### Screening
 
-| Field | Default | Description |
-|---|---|---|
-| `minFeeActiveTvlRatio` | `0.05` | Minimum fee/active-TVL ratio |
-| `minTvl` | `10000` | Minimum pool TVL (USD) |
-| `maxTvl` | `150000` | Maximum pool TVL (USD) |
-| `minVolume` | `500` | Minimum pool volume |
-| `minOrganic` | `60` | Minimum organic score (0–100) |
-| `minHolders` | `500` | Minimum token holder count |
-| `minMcap` | `150000` | Minimum market cap (USD) |
-| `maxMcap` | `10000000` | Maximum market cap (USD) |
-| `minBinStep` | `80` | Minimum bin step |
-| `maxBinStep` | `125` | Maximum bin step |
-| `timeframe` | `5m` | Candle timeframe for screening |
-| `category` | `trending` | Pool category filter |
-| `minTokenFeesSol` | `30` | Minimum all-time fees in SOL |
-| `maxBotHoldersPct` | `30` | Maximum bot holder % (Jupiter audit) |
-| `maxTop10Pct` | `60` | Maximum top-10 holder concentration |
-| `blockedLaunchpads` | `[]` | Launchpad names to never deploy into |
-| `extraSearchSymbols` | `[]` | Extra token symbols to search and merge into screening candidates |
-| `extraSearchLimitPerSymbol` | `6` | Max search results to inspect for each extra symbol |
-| `extraSearchOnlySolPools` | `true` | Keep extra search limited to SOL pairs |
+| Field | Base fallback | Rotation default | Description |
+|---|---:|---:|---|
+| `minFeeActiveTvlRatio` | `0.05` | `1.0` | 30m fee/active-TVL floor; modeled cost coverage may raise admission further |
+| `minTvl` / `minActiveTvl` | `10000` | `400` | Minimum pool and active TVL (USD) |
+| `maxTvl` | `150000` | `300000` | Maximum active TVL (USD) |
+| `minVolume` | `500` | `250` | Minimum timeframe volume (USD) |
+| `maxVolatility` | none | `< 7.5` | Exclusive volatility ceiling |
+| `minOrganic` | `60` | `70` | Minimum organic score (0–100) |
+| `minHolders` | `500` | `500` | Minimum token holder count |
+| `minMcap` | `150000` | `50000` | Minimum market cap (USD) |
+| `maxMcap` | `10000000` | `50000000` | Maximum market cap (USD) |
+| `minTokenFeesSol` | `30` | `80` | Minimum global fees paid in SOL |
+| `maxBotHoldersPct` | `30` | `25` | Maximum bot-holder percentage |
+| `maxTop10Pct` | `60` | `30` | Maximum top-10 holder concentration |
+| Candidate confirmation | `2`, at least `2m` apart | `3`, at least `30s` apart | Fee/volume retention and, in rotation, price/bin stability |
+| Token age | unbounded | `1h–72h` | Minimum and maximum token age |
+| `minBinStep` / `maxBinStep` | `80` / `125` | same | Allowed DLMM bin step |
+| `blockedLaunchpads` | `[]` | same | Launchpad names to reject |
+| `extraSearchSymbols` | `[]` | same | Extra symbols merged into discovery |
+| `extraSearchOnlySolPools` | `true` | same | Restrict extra discovery to SOL pairs |
+| `avoidPvpSymbols` / `blockPvpSymbols` | `true` / `false` | configured | Detect same-symbol rival mints; when blocking is enabled, keep only the deterministic highest-scoring eligible pool per symbol |
 
 ### Management
 
+| Field | Base fallback | Rotation default | Description |
+|---|---:|---:|---|
+| `deployAmountSol` | `0.5` | `0.20` | SOL requested per new position |
+| `maxPositions` | `3` | `1` | Maximum simultaneous positions |
+| `strategy` | `bid_ask` | `spot` | DLMM liquidity strategy |
+| Range | minimum `35` bins below | `5 below + 0 above` | Locked rotation uses single-side SOL funding |
+| `outOfRangeWaitMinutes` | `30` | `5` above-range exit | Time before an OOR exit is eligible |
+| `stopLossPct` | `-50` | `-1` | Projected equity-net stop loss |
+| `catastrophicStopPct` | `-2.5` | `-1.5` | Immediate catastrophic boundary |
+| `takeProfitPct` | `5` | `0.5` | Projected equity-net take profit |
+| `takeProfitExecutionBufferPct` | `0` | `0.75` | Additive projected-close reserve; rotation TP gate is therefore `1.25%` |
+| `estimatedRoundTripCostPct` | `1.0` | `0.4` | Cost assumption used by admission/exit modeling |
+| `minNetProfitPct` | `0.25` | `0.10` | Minimum modeled net-profit percentage |
+| `minNetProfitSol` | `0.0005` | `0.00005` | Minimum modeled net-profit SOL |
+| `maxHoldMinutes` | `360` | `90` | Maximum bounded hold time |
+
+The base yield-hold entry policy requires 5m RSI at least `40` and 15m RSI at least `35`; the rotation defaults are `35` and `40`, respectively. Both reject overextended RSI (`75`/`80`). Fee admission uses the same conservative assumptions as paper valuation: 50% fee haircut, 25% participation, modeled round-trip cost, and at most a six-hour coverage horizon. A shadow stop-loss blocks the pool and base token for the remainder of that evidence epoch.
+
+The locked rotation profile is a micro/trending-pool rollout shared by shadow and the only authorized live canary. It uses one sequential `0.20 SOL` position, a live-compatible single-side SOL `5 below + 0 above` spot range, 5m/15m trend continuation, three stability observations at least 30 seconds apart, and a position-notional cap of 2% of active TVL. Rotation candidates default to a 72-hour maximum token age, 1.0% minimum 30m fee/active-TVL, volatility below 7.5, 15m RSI of at least 40, and 5m RSI below 75. Stability includes fee, volume, and price: a peak-to-current drawdown of 1.5% or a consecutive downside move of two DLMM bins resets confirmation. When a qualified token has same-symbol rival mints, deterministic score ranking retains one canonical eligible pool rather than dropping the whole symbol. Open paper positions are observed by a read-only 15-second monitor; a catastrophic stop quarantines the pool and mint for seven days, while the run-level cooldown prevents repeat use in the same evidence epoch. Discovery still enforces mint/freeze authority, concentration, SOL-quote, blocklist, and bounded bot-holder audits. Evidence is labeled `rotation_live_v1` and every lifecycle must use exactly `0.20 SOL`; older `rotation_v1` balanced-proxy evidence cannot authorize this canary. Normally, live remains fail-closed until the historical, 24-hour heartbeat, five-settled-lifecycle, strictly positive net, profit factor of at least `1.2`, maximum single loss of at most `2.5%`, drawdown, reconciliation, cleanup, breaker, and exact-exposure gates all pass. An exact operator override can bypass source-readiness gates, but all transaction, exposure, lifecycle, cleanup, guard, and breaker boundaries remain enforced.
+
+### Ledger, cleanup, and circuit breaker
+
 | Field | Default | Description |
-|---|---|---|
-| `deployAmountSol` | `0.5` | Base SOL per new position |
-| `positionSizePct` | `0.35` | Fraction of deployable balance to use |
-| `maxDeployAmount` | `50` | Maximum SOL cap per position |
-| `gasReserve` | `0.2` | Minimum SOL to keep for gas |
-| `minSolToOpen` | `0.55` | Minimum wallet SOL before opening |
-| `outOfRangeWaitMinutes` | `30` | Minutes OOR before acting |
-| `stopLossPct` | `-15` | Close position if price drops by this % |
-| `takeProfitPct` | `5` | Close when fees earned reach this % of capital |
-| `trailingTakeProfit` | `true` | Enable trailing take-profit |
-| `trailingTriggerPct` | `3` | Activate trailing TP at this PnL % |
-| `trailingDropPct` | `1.5` | Close when PnL drops this % from peak |
-| `strategy` | `bid_ask` | LP strategy: `spot`, `bid_ask`, or `curve` |
+|---|---:|---|
+| `ledgerEnabled` | `true` | Enable authoritative lifecycle accounting |
+| `ledgerPath` | `trade-ledger.jsonl` | Append-only ledger path, relative to the repository unless absolute |
+| `ledgerReconcileToleranceLamports` | `10000` | Maximum absolute settlement reconciliation error |
+| `cleanupEnabled` | `true` | Enable position-scoped post-close cleanup and retry |
+| `cleanupMaxPriceImpactPct` | `5` | Maximum cleanup swap price impact |
+| `circuitBreakerEnabled` | `true` | Enable durable live-entry breaker |
+| `circuitAutomaticResume` | `true` | Automatically recover economic/operational latches after clean zero-exposure proof |
+| `circuitAutomaticResumeCooldownSeconds` | `60` | Minimum clean-state delay before a recoverable latch starts a fresh risk epoch |
+| `circuitConsecutiveLosses` | `2` | Consecutive settled net losses before latching |
+| `circuitSingleLossPct` | `-2` | Exclusive single-trade loss boundary |
+| `circuitDailyLossMinSol` | `0.003` | Minimum rolling 24h loss limit |
+| `circuitDailyLossPct` | `1.5` | Rolling loss limit as a percentage of equity |
+| `circuitCanaryDrawdownPct` | `3` | Canary peak-to-current drawdown latch |
 
 ### Schedule
 
-| Field | Default | Description |
-|---|---|---|
-| `managementIntervalMin` | `10` | Management cycle frequency (minutes) |
-| `screeningIntervalMin` | `30` | Screening cycle frequency (minutes) |
+| Field | Base fallback | Rotation behavior | Description |
+|---|---:|---:|---|
+| `managementIntervalMin` | `10` | configured value | Management cycle frequency (minutes) |
+| `screeningIntervalMin` | `30` | `1` | Screening cycle frequency (minutes) |
+| `pnlPollIntervalSec` | `30` | configured value | Deterministic position observation frequency |
+| `opportunityPollIntervalSec` | `45` | configured value | Lightweight trending-opportunity trigger frequency |
 
 ### Models
 
 | Field | Default | Description |
 |---|---|---|
-| `managementModel` | `openai/gpt-oss-20b:free` | LLM for management cycles |
-| `screeningModel` | `openai/gpt-oss-20b:free` | LLM for screening cycles |
-| `generalModel` | `openai/gpt-oss-20b:free` | LLM for REPL / chat |
+| `managementModel` | `openrouter/healer-alpha` | LLM for management cycles |
+| `screeningModel` | `openrouter/hunter-alpha` | LLM for screening veto/reports |
+| `generalModel` | `openrouter/healer-alpha` | LLM for REPL / chat |
 
 > Override model at runtime: `node cli.js config set screeningModel anthropic/claude-opus-4-5`
 
 ### Jupiter swap fee (referral)
 
-Every token swap the agent makes (auto-swap base→SOL after a close/claim, manual `swap_token`) goes through **Jupiter Ultra**. Jupiter's referral program lets a referral wallet collect a small fee, expressed in **basis points (bps)** — `1 bps = 0.01%`, so `50 bps = 0.5%`. Meridian ships with this enabled by default.
+Every direct token swap goes through **Jupiter Ultra**. Closing or claiming a position never triggers a wallet-wide follow-up swap. Jupiter's referral program lets a referral wallet collect a small fee, expressed in **basis points (bps)** — `1 bps = 0.01%`, so `50 bps = 0.5%`. Meridian ships with this enabled by default.
 
 **Settings** (env only — *not* in `user-config.json`):
 
@@ -555,7 +725,12 @@ JUPITER_REFERRAL_FEE_BPS=50
 
 ### Lessons
 
-After every closed position the agent runs `studyTopLPers` on candidate pools, analyzes on-chain behavior of top performers (hold duration, entry/exit timing, win rates), and saves concrete lessons. Lessons are injected into subsequent agent cycles as part of the system context.
+The repository retains manual lessons, performance-history, and top-LPer study
+tools. During the locked dry-run/canary rollout, `learningFrozen=true`:
+automatic close-performance writes, generated lessons, prompt injection,
+HiveMind sharing, and threshold evolution are disabled so the evidence source
+cannot mutate the policy being evaluated. Explicit operator lesson maintenance
+remains available for later use.
 
 Add a lesson manually:
 ```bash
@@ -564,25 +739,35 @@ node cli.js lessons add "Never deploy into pump.fun tokens under 2h old"
 
 ### Threshold evolution
 
-After 5+ positions have been closed, run:
+Outside a frozen rollout, after 5+ compatible performance records, run:
 ```bash
 node cli.js evolve
 ```
 
-This analyzes closed position performance (win rate, avg PnL, fee yields) and automatically adjusts screening thresholds in `user-config.json`. Changes take effect immediately.
+This analyzes performance history and adjusts screening thresholds in
+`user-config.json`. In the current locked baseline it returns
+`ROLLOUT_BASELINE_LEARNING_FROZEN` and performs no mutation.
 
 ---
 
 ## HiveMind
 
-HiveMind sync uses Agent Meridian at `https://api.agentmeridian.xyz` by default with the built-in public key. Agents can register, pull shared lessons/presets, and push learning events without a separate registration flow.
+HiveMind integrations remain in the repository, but the current locked
+shadow/canary baseline forces `hiveMindEnabled=false`. Startup therefore logs
+`Disabled by the locked rollout baseline`; configured endpoints or API keys do
+not reactivate it in this stage.
 
-**What you get:**
+If a later adaptive rollout explicitly enables HiveMind, it uses Agent
+Meridian at `https://api.agentmeridian.xyz` by default with the built-in public
+key. Agents can then register, pull shared lessons/presets, and push learning
+events without a separate registration flow.
+
+**When enabled, what you get:**
 - Shared lessons from other Meridian agents
 - Strategy presets and crowd performance context
 - Role-aware lessons injected into future screener/manager prompts when `hiveMindPullMode` is `auto`
 
-**What you share:**
+**When enabled, what you share:**
 - Lessons from `lessons.json`
 - Closed-position performance events: pool, pool name, base mint, strategy, close reason, PnL, fees, and hold time
 - Agent heartbeat metadata: agent ID, version, timestamp, and basic capability flags
@@ -592,7 +777,9 @@ HiveMind failures are non-blocking. If Agent Meridian is unavailable, the agent 
 
 ### Setup
 
-No manual HiveMind registration command is required for the shared Agent Meridian setup. `agentId` is generated automatically on startup if it is missing.
+No manual HiveMind registration command is required for the shared Agent
+Meridian setup. In an enabled stage, `agentId` is generated automatically on
+startup if it is missing.
 
 To use a private HiveMind API key, check the Telegram announcement channel and set it as `hiveMindApiKey`.
 
@@ -607,11 +794,15 @@ Relevant config fields:
 }
 ```
 
-Blank `hiveMindUrl` and `hiveMindApiKey` values intentionally fall back to the Agent Meridian defaults. Set `hiveMindPullMode` to `manual` if you do not want shared lessons and presets pulled automatically.
+Blank `hiveMindUrl` and `hiveMindApiKey` values retain the Agent Meridian
+fallbacks for a future enabled stage. They do not override the current locked
+off switch.
 
 ### Disable
 
-There is currently no empty-string disable path for HiveMind; blank values fall back to the built-in Agent Meridian defaults. A true off switch should be implemented as an explicit config flag before documenting HiveMind as disabled by clearing fields.
+Do not rely on clearing URL/key fields to disable HiveMind; the current off
+state comes from the immutable rollout baseline. A future stage should expose
+an explicit, separately reviewed enable/disable transition.
 
 ---
 
@@ -636,6 +827,15 @@ config.js           Runtime config from user-config.json + .env (repo-root paths
 repo-root.js        Stable absolute repo path — used by PM2, state files, and .env loading
 prompt.js           System prompt builder (SCREENER / MANAGER / GENERAL roles)
 state.js            Position registry (state.json)
+trade-ledger.js     Append-only lifecycle event model and settlement accounting
+ledger-runtime.js   Receipt decoding, lifecycle transitions, operation leases, reconciliation
+cleanup-runtime.js  Position-scoped residual scan, cleanup execution, and settlement finalization
+circuit-breaker.js  Pure risk-breaker reducer and automatic-resume audit state
+breaker-runtime.js  Private durable breaker storage and serialized controller
+automatic-breaker-resume.js  Zero-exposure automatic recovery policy for economic/operational latches
+durable-file.js     Descriptor-safe atomic files, locks, and durability markers
+shadow-lifecycle.js Conservative paper lifecycle observation and settlement
+rollout-evidence.js Append-only shadow heartbeat evidence and validation
 decision-log.js     Structured decision log for deploy, close, skip, and no-deploy rationale
 lessons.js          Learning engine: records performance, derives lessons, evolves thresholds
 pool-memory.js      Per-pool deploy history + snapshots
@@ -649,6 +849,8 @@ cli.js              Direct CLI — every tool as a subcommand with JSON output
 tools/
   definitions.js    Tool schemas (OpenAI format)
   executor.js       Tool dispatch + safety checks
+  rollout-safety.js Effective dry-run/canary authorization and immutable canary limits
+  token-cleanup.js  Scoped token-account cleanup planning and execution primitives
   dlmm.js           Meteora DLMM SDK wrapper
   screening.js      Pool discovery
   wallet.js         SOL/token balances + Jupiter swap
@@ -678,6 +880,6 @@ discord-listener/
 
 ## Disclaimer
 
-This software is provided as-is, with no warranty. Running an autonomous trading agent carries real financial risk — you can lose funds. Always start with `DRY_RUN=true` to verify behavior before going live. Never deploy more capital than you can afford to lose. This is not financial advice.
+This software is provided as-is, with no warranty. Running an autonomous trading agent carries real financial risk — you can lose funds. Always start with `dryRun=true` and `rolloutMode="dry_run"` in `user-config.json`, verify the startup log says `Effective mode: DRY RUN`, and use `EMERGENCY_STOP=true` when a one-way safe startup latch is required. Never deploy more capital than you can afford to lose. This is not financial advice.
 
 The authors are not responsible for any losses incurred through use of this software.

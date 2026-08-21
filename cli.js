@@ -4,24 +4,18 @@
  * Direct tool invocation with JSON output. Agent-native.
  */
 
-import { loadEnv } from "./envcrypt.js";
-import { parseArgs } from "util";
-import os from "os";
-import fs from "fs";
-import path from "path";
+import os from "node:os";
+import fs from "node:fs";
+import path from "node:path";
+import { canonicalCliPublicKey, preflightCli } from "./cli-preflight.js";
 
-// ─── DRY_RUN must be set before any tool imports ─────────────────
-if (process.argv.includes("--dry-run")) process.env.DRY_RUN = "true";
-
-// ─── Load .env from ~/.meridian/ if present ──────────────────────
-const meridianDir = path.join(os.homedir(), ".meridian");
-const meridianEnv = path.join(meridianDir, ".env");
-if (fs.existsSync(meridianEnv)) {
-  loadEnv({
-    envPath: meridianEnv,
-    keyPath: path.join(meridianDir, ".envrypt"),
-    override: false,
-  });
+// This must be the first project decision. In particular, do not load
+// envcrypt (which loads .env at module evaluation) until untrusted authority
+// input has been syntactically and canonically accepted.
+const preflight = preflightCli(process.argv.slice(2));
+if (!preflight.ok) {
+  fs.writeSync(2, JSON.stringify({ error: preflight.error }) + "\n");
+  process.exit(1);
 }
 
 // ─── Output helpers ───────────────────────────────────────────────
@@ -30,8 +24,19 @@ function out(data) {
 }
 
 function die(msg, extra = {}) {
-  process.stderr.write(JSON.stringify({ error: msg, ...extra }) + "\n");
+  // Use a synchronous write because this CLI exits immediately and callers
+  // commonly capture stderr through a pipe.
+  fs.writeSync(2, JSON.stringify({ error: msg, ...extra }) + "\n");
   process.exit(1);
+}
+
+// CLI public-key flags are an authority boundary. Do not trim or otherwise
+// repair user input: one exact canonical base58 public key is required before
+// any executor or DLMM implementation is imported.
+function requireCliPublicKey(value, flag) {
+  const canonical = canonicalCliPublicKey(value);
+  if (!canonical) die(`${flag} must be one exact canonical Solana public key`);
+  return canonical;
 }
 
 // ─── SKILL.md generation ──────────────────────────────────────────
@@ -84,13 +89,13 @@ Output: { success, position, txs, base_mint }
 \`\`\`
 
 ### meridian close --position <addr> [--skip-swap] [--dry-run]
-Closes a position. Auto-swaps base token to SOL unless --skip-swap.
+Closes a position. It does not swap wallet tokens; --skip-swap is accepted as a legacy no-op.
 \`\`\`
 Output: { success, pnl_pct, pnl_usd, txs, base_mint }
 \`\`\`
 
-### meridian swap --from <mint> --to <mint> --amount <n> [--dry-run]
-Swaps tokens via Jupiter. Use "SOL" as mint shorthand.
+### meridian swap --from <SOL|USDC|USDT|base58_mint> --to <SOL|USDC|USDT|base58_mint> --amount <token_unit_decimal> [--dry-run]
+Swaps tokens via Jupiter. \`--amount\` is always positive token-unit decimal text; Meridian validates its precision and converts it internally using the source mint's authoritative decimals.
 \`\`\`
 Output: { success, tx, input_amount, output_amount }
 \`\`\`
@@ -155,7 +160,7 @@ Returns the full runtime config.
 ### meridian config set <key> <value>
 Updates a config key. Parses value as JSON when possible.
 \`\`\`
-Valid keys: minTvl, maxTvl, minVolume, maxPositions, deployAmountSol, managementIntervalMin, screeningIntervalMin, managementModel, screeningModel, generalModel, autoSwapAfterClaim, minClaimAmount, outOfRangeWaitMinutes
+Valid keys: minTvl, maxTvl, minVolume, maxPositions, deployAmountSol, managementIntervalMin, screeningIntervalMin, managementModel, screeningModel, generalModel, minClaimAmount, outOfRangeWaitMinutes
 \`\`\`
 
 ### meridian lessons [--limit 50]
@@ -214,49 +219,36 @@ Starts the autonomous agent with cron jobs (management + screening).
 --silent      Suppress Telegram notifications for this run
 `;
 
+// Help is a pure path: argv has already passed preflight, but no env, config,
+// wallet, executor, DLMM module, or HOME write is needed to render it.
+if (preflight.help) {
+  fs.writeSync(1, SKILL_MD);
+  process.exit(0);
+}
+
+// ─── DRY_RUN must be set before any tool imports ─────────────────
+if (preflight.flags["dry-run"] === true) process.env.DRY_RUN = "true";
+
+const { loadEnv } = await import("./envcrypt.js");
+
+// ─── Load .env from ~/.meridian/ if present ──────────────────────
+const meridianDir = path.join(os.homedir(), ".meridian");
+const meridianEnv = path.join(meridianDir, ".env");
+if (fs.existsSync(meridianEnv)) {
+  loadEnv({
+    envPath: meridianEnv,
+    keyPath: path.join(meridianDir, ".envrypt"),
+    override: false,
+  });
+}
+
 fs.mkdirSync(meridianDir, { recursive: true });
 fs.writeFileSync(path.join(meridianDir, "SKILL.md"), SKILL_MD);
 
 // ─── Parse args ───────────────────────────────────────────────────
-const argv = process.argv.slice(2);
-const subcommand = argv.find(a => !a.startsWith("-"));
-const sub2 = argv.filter(a => !a.startsWith("-"))[1]; // for "config get/set"
-const silent = argv.includes("--silent");
-
-if (!subcommand || subcommand === "help" || argv.includes("--help")) {
-  process.stdout.write(SKILL_MD);
-  process.exit(0);
-}
-
-// ─── Parse flags ──────────────────────────────────────────────────
-const { values: flags } = parseArgs({
-  args: argv,
-  options: {
-    pool:       { type: "string" },
-    amount:     { type: "string" },
-    position:   { type: "string" },
-    from:       { type: "string" },
-    to:         { type: "string" },
-    strategy:   { type: "string" },
-    query:      { type: "string" },
-    mint:       { type: "string" },
-    wallet:     { type: "string" },
-    timeframe:  { type: "string" },
-    reason:     { type: "string" },
-    "bins-below": { type: "string" },
-    "bins-above": { type: "string" },
-    "amount-x":   { type: "string" },
-    "amount-y":   { type: "string" },
-    "bps":        { type: "string" },
-    "no-claim":   { type: "boolean" },
-    "skip-swap":  { type: "boolean" },
-    "dry-run":    { type: "boolean" },
-    "silent":     { type: "boolean" },
-    limit:        { type: "string" },
-  },
-  allowPositionals: true,
-  strict: false,
-});
+const { flags, positionals, command: subcommand } = preflight;
+const sub2 = positionals[1]; // for "config get/set"
+const silent = flags.silent === true;
 
 // ─── Commands ─────────────────────────────────────────────────────
 
@@ -278,26 +270,27 @@ switch (subcommand) {
 
   // ── pnl <position_address> ───────────────────────────────────────
   case "pnl": {
-    const posAddr = argv.find((a, i) => !a.startsWith("-") && i > 0 && argv[i - 1] !== "--position" && a !== "pnl");
+    const posAddr = positionals[1];
     const positionAddress = flags.position || posAddr;
     if (!positionAddress) die("Usage: meridian pnl <position_address>");
+    const canonicalPositionAddress = requireCliPublicKey(positionAddress, "position address");
 
     const { getTrackedPosition } = await import("./state.js");
     const { getPositionPnl, getMyPositions } = await import("./tools/dlmm.js");
 
     let poolAddress;
-    const tracked = getTrackedPosition(positionAddress);
+    const tracked = getTrackedPosition(canonicalPositionAddress);
     if (tracked?.pool) {
       poolAddress = tracked.pool;
     } else {
       // Fall back: scan positions to find pool
       const pos = await getMyPositions({ force: true });
-      const found = pos.positions?.find(p => p.position === positionAddress);
-      if (!found) die("Position not found", { position: positionAddress });
+      const found = pos.positions?.find(p => p.position === canonicalPositionAddress);
+      if (!found) die("Position not found", { position: canonicalPositionAddress });
       poolAddress = found.pool;
     }
 
-    const pnl = await getPositionPnl({ pool_address: poolAddress, position_address: positionAddress });
+    const pnl = await getPositionPnl({ pool_address: poolAddress, position_address: canonicalPositionAddress });
     if (tracked?.strategy) pnl.strategy = tracked.strategy;
     if (tracked?.instruction) pnl.instruction = tracked.instruction;
     out(pnl);
@@ -369,7 +362,8 @@ switch (subcommand) {
 
   // ── token-info ──────────────────────────────────────────────────
   case "token-info": {
-    const query = flags.query || flags.mint || argv.find((a, i) => !a.startsWith("-") && i > 0 && a !== "token-info");
+    const canonicalMint = flags.mint ? requireCliPublicKey(flags.mint, "--mint") : null;
+    const query = flags.query || canonicalMint || positionals[1];
     if (!query) die("Usage: meridian token-info --query <mint_or_symbol>");
     const { getTokenInfo } = await import("./tools/token.js");
     out(await getTokenInfo({ query }));
@@ -378,34 +372,37 @@ switch (subcommand) {
 
   // ── token-holders ─────────────────────────────────────────────
   case "token-holders": {
-    const mint = flags.mint || argv.find((a, i) => !a.startsWith("-") && i > 0 && a !== "token-holders");
+    const mint = flags.mint || positionals[1];
     if (!mint) die("Usage: meridian token-holders --mint <addr>");
+    const canonicalMint = requireCliPublicKey(mint, "--mint");
     const { getTokenHolders } = await import("./tools/token.js");
     const limit = flags.limit ? parseInt(flags.limit) : 20;
-    out(await getTokenHolders({ mint, limit }));
+    out(await getTokenHolders({ mint: canonicalMint, limit }));
     break;
   }
 
   // ── token-narrative ───────────────────────────────────────────
   case "token-narrative": {
-    const mint = flags.mint || argv.find((a, i) => !a.startsWith("-") && i > 0 && a !== "token-narrative");
+    const mint = flags.mint || positionals[1];
     if (!mint) die("Usage: meridian token-narrative --mint <addr>");
+    const canonicalMint = requireCliPublicKey(mint, "--mint");
     const { getTokenNarrative } = await import("./tools/token.js");
-    out(await getTokenNarrative({ mint }));
+    out(await getTokenNarrative({ mint: canonicalMint }));
     break;
   }
 
   // ── pool-detail ───────────────────────────────────────────────
   case "pool-detail": {
     if (!flags.pool) die("Usage: meridian pool-detail --pool <addr> [--timeframe 5m]");
+    const canonicalPool = requireCliPublicKey(flags.pool, "--pool");
     const { getPoolDetail } = await import("./tools/screening.js");
-    out(await getPoolDetail({ pool_address: flags.pool, timeframe: flags.timeframe || "5m" }));
+    out(await getPoolDetail({ pool_address: canonicalPool, timeframe: flags.timeframe || "5m" }));
     break;
   }
 
   // ── search-pools ──────────────────────────────────────────────
   case "search-pools": {
-    const query = flags.query || argv.find((a, i) => !a.startsWith("-") && i > 0 && a !== "search-pools");
+    const query = flags.query || positionals[1];
     if (!query) die("Usage: meridian search-pools --query <name_or_symbol>");
     const { searchPools } = await import("./tools/dlmm.js");
     const limit = flags.limit ? parseInt(flags.limit) : 10;
@@ -416,36 +413,39 @@ switch (subcommand) {
   // ── active-bin ────────────────────────────────────────────────
   case "active-bin": {
     if (!flags.pool) die("Usage: meridian active-bin --pool <addr>");
+    const canonicalPool = requireCliPublicKey(flags.pool, "--pool");
     const { getActiveBin } = await import("./tools/dlmm.js");
-    out(await getActiveBin({ pool_address: flags.pool }));
+    out(await getActiveBin({ pool_address: canonicalPool }));
     break;
   }
 
   // ── wallet-positions ──────────────────────────────────────────
   case "wallet-positions": {
-    const wallet = flags.wallet || argv.find((a, i) => !a.startsWith("-") && i > 0 && a !== "wallet-positions");
+    const wallet = flags.wallet || positionals[1];
     if (!wallet) die("Usage: meridian wallet-positions --wallet <addr>");
+    const canonicalWallet = requireCliPublicKey(wallet, "wallet address");
     const { getWalletPositions } = await import("./tools/dlmm.js");
-    out(await getWalletPositions({ wallet_address: wallet }));
+    out(await getWalletPositions({ wallet_address: canonicalWallet }));
     break;
   }
 
   // ── deploy ───────────────────────────────────────────────────────
   case "deploy": {
     if (!flags.pool) die("Usage: meridian deploy --pool <addr> --amount <sol>");
+    const canonicalPool = requireCliPublicKey(flags.pool, "--pool");
     const amountX = flags["amount-x"] ? parseFloat(flags["amount-x"]) : undefined;
     if (!flags.amount && !amountX) die("--amount or --amount-x is required");
 
     const { executeTool } = await import("./tools/executor.js");
     out(await executeTool("deploy_position", {
-      pool_address: flags.pool,
+      pool_address: canonicalPool,
       amount_y: flags.amount ? parseFloat(flags.amount) : undefined,
       amount_x: amountX,
       strategy: flags.strategy,
-      single_sided_x: argv.includes("--single-sided-x"),
+      single_sided_x: flags["single-sided-x"] === true,
       bins_below: flags["bins-below"] ? parseInt(flags["bins-below"]) : undefined,
       bins_above: flags["bins-above"] ? parseInt(flags["bins-above"]) : undefined,
-      allow_duplicate_pool: argv.includes("--allow-duplicate-pool"),
+      allow_duplicate_pool: flags["allow-duplicate-pool"] === true,
     }));
     break;
   }
@@ -453,17 +453,21 @@ switch (subcommand) {
   // ── claim ────────────────────────────────────────────────────────
   case "claim": {
     if (!flags.position) die("Usage: meridian claim --position <addr>");
+    const canonicalPosition = requireCliPublicKey(flags.position, "--position");
     const { executeTool } = await import("./tools/executor.js");
-    out(await executeTool("claim_fees", { position_address: flags.position }));
+    out(await executeTool("claim_fees", { position_address: canonicalPosition }));
     break;
   }
 
   // ── close ────────────────────────────────────────────────────────
   case "close": {
     if (!flags.position) die("Usage: meridian close --position <addr>");
+    const canonicalPosition = requireCliPublicKey(flags.position, "--position");
     const { executeTool } = await import("./tools/executor.js");
     out(await executeTool("close_position", {
-      position_address: flags.position,
+      position_address: canonicalPosition,
+      // Legacy callers may still send this capability marker. closePosition
+      // ignores it, so preserving it cannot re-enable wallet-wide auto-swaps.
       skip_swap: flags["skip-swap"] ?? false,
     }));
     break;
@@ -471,13 +475,11 @@ switch (subcommand) {
 
   // ── swap ─────────────────────────────────────────────────────────
   case "swap": {
-    if (!flags.from || !flags.to || !flags.amount) die("Usage: meridian swap --from <mint> --to <mint> --amount <n>");
+    if (!flags.from || !flags.to || !flags.amount) die("Usage: meridian swap --from <SOL|USDC|USDT|base58_mint> --to <SOL|USDC|USDT|base58_mint> --amount <token_unit_decimal>");
+    const authority = preflight.swapAuthority;
+    if (!authority) die("Swap authority preflight failed");
     const { executeTool } = await import("./tools/executor.js");
-    out(await executeTool("swap_token", {
-      input_mint: flags.from,
-      output_mint: flags.to,
-      amount: parseFloat(flags.amount),
-    }));
+    out(await executeTool("swap_token", authority));
     break;
   }
 
@@ -503,8 +505,8 @@ switch (subcommand) {
       const { config } = await import("./config.js");
       out(config);
     } else if (sub2 === "set") {
-      const key = argv.filter(a => !a.startsWith("-"))[2];
-      const rawVal = argv.filter(a => !a.startsWith("-"))[3];
+      const key = positionals[2];
+      const rawVal = positionals[3];
       if (!key || rawVal === undefined) die("Usage: meridian config set <key> <value>");
       let value = rawVal;
       try { value = JSON.parse(rawVal); } catch { /* keep as string */ }
@@ -519,9 +521,10 @@ switch (subcommand) {
   // ── study ────────────────────────────────────────────────────────
   case "study": {
     if (!flags.pool) die("Usage: meridian study --pool <addr> [--limit 4]");
+    const canonicalPool = requireCliPublicKey(flags.pool, "--pool");
     const { studyTopLPers } = await import("./tools/study.js");
     const limit = flags.limit ? parseInt(flags.limit) : 4;
-    out(await studyTopLPers({ pool_address: flags.pool, limit }));
+    out(await studyTopLPers({ pool_address: canonicalPool, limit }));
     break;
   }
 
@@ -536,7 +539,7 @@ switch (subcommand) {
   // ── lessons ──────────────────────────────────────────────────────
   case "lessons": {
     if (sub2 === "add") {
-      const text = argv.filter(a => !a.startsWith("-")).slice(2).join(" ");
+      const text = positionals.slice(2).join(" ");
       if (!text) die("Usage: meridian lessons add <text>");
       const { addLesson } = await import("./lessons.js");
       addLesson(text, [], { pinned: false, role: null });
@@ -552,8 +555,9 @@ switch (subcommand) {
   // ── pool-memory ──────────────────────────────────────────────────
   case "pool-memory": {
     if (!flags.pool) die("Usage: meridian pool-memory --pool <addr>");
+    const canonicalPool = requireCliPublicKey(flags.pool, "--pool");
     const { getPoolMemory } = await import("./pool-memory.js");
-    out(getPoolMemory({ pool_address: flags.pool }));
+    out(getPoolMemory({ pool_address: canonicalPool }));
     break;
   }
 
@@ -581,8 +585,9 @@ switch (subcommand) {
     if (sub2 === "add") {
       if (!flags.mint) die("Usage: meridian blacklist add --mint <addr> --reason <text>");
       if (!flags.reason) die("--reason is required");
+      const canonicalMint = requireCliPublicKey(flags.mint, "--mint");
       const { addToBlacklist } = await import("./token-blacklist.js");
-      out(addToBlacklist({ mint: flags.mint, reason: flags.reason }));
+      out(addToBlacklist({ mint: canonicalMint, reason: flags.reason }));
     } else if (sub2 === "list" || !sub2) {
       const { listBlacklist } = await import("./token-blacklist.js");
       out(listBlacklist());
@@ -645,12 +650,14 @@ switch (subcommand) {
   case "withdraw-liquidity": {
     if (!flags.position) die("Usage: meridian withdraw-liquidity --position <addr> --pool <addr> [--bps 10000]");
     if (!flags.pool) die("--pool is required");
+    const canonicalPosition = requireCliPublicKey(flags.position, "--position");
+    const canonicalPool = requireCliPublicKey(flags.pool, "--pool");
     const { withdrawLiquidity } = await import("./tools/dlmm.js");
     out(await withdrawLiquidity({
-      position_address: flags.position,
-      pool_address: flags.pool,
+      position_address: canonicalPosition,
+      pool_address: canonicalPool,
       bps: flags.bps ? parseInt(flags.bps) : 10000,
-      claim_fees: !argv.includes("--no-claim"),
+      claim_fees: flags["no-claim"] !== true,
     }));
     break;
   }
@@ -659,14 +666,16 @@ switch (subcommand) {
   case "add-liquidity": {
     if (!flags.position) die("Usage: meridian add-liquidity --position <addr> --pool <addr> [--amount-x <n>] [--amount-y <n>]");
     if (!flags.pool) die("--pool is required");
+    const canonicalPosition = requireCliPublicKey(flags.position, "--position");
+    const canonicalPool = requireCliPublicKey(flags.pool, "--pool");
     const { addLiquidity } = await import("./tools/dlmm.js");
     out(await addLiquidity({
-      position_address: flags.position,
-      pool_address: flags.pool,
+      position_address: canonicalPosition,
+      pool_address: canonicalPool,
       amount_x: flags["amount-x"] ? parseFloat(flags["amount-x"]) : 0,
       amount_y: flags["amount-y"] ? parseFloat(flags["amount-y"]) : 0,
       strategy: flags.strategy || "spot",
-      single_sided_x: argv.includes("--single-sided-x"),
+      single_sided_x: flags["single-sided-x"] === true,
     }));
     break;
   }
@@ -674,3 +683,5 @@ switch (subcommand) {
   default:
     die(`Unknown command: ${subcommand}. Run 'meridian help' for usage.`);
 }
+
+export { canonicalCliPublicKey };

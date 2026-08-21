@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cleanNetPnlPct, getPoolMemoryPolicy, recomputeAggregates } from "../pool-memory.js";
+import { cleanNetPnlPct, getPoolMemoryPolicy, isStopLossCloseReason, recomputeAggregates } from "../pool-memory.js";
 
 assert.equal(cleanNetPnlPct({
   position_sol_deployed: 0.2,
@@ -47,5 +47,8 @@ assert.equal(entry.last_outcome, "low_yield");
 const now = Date.parse("2026-07-13T00:00:00Z");
 assert.match(getPoolMemoryPolicy({}, now), /advisory only/);
 assert.match(getPoolMemoryPolicy({ cooldown_until: "2026-07-13T01:00:00Z" }, now), /hard block/);
+assert.equal(isStopLossCloseReason("Net stop loss: projected equity-net -1.3%"), true);
+assert.equal(isStopLossCloseReason("Rotation fee thesis failed after 20m"), true);
+assert.equal(isStopLossCloseReason("Net take profit"), false);
 
 console.log("pool-memory net tests passed");

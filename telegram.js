@@ -6,6 +6,14 @@ const USER_CONFIG_PATH = repoPath("user-config.json");
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || null;
 const BASE  = TOKEN ? `https://api.telegram.org/bot${TOKEN}` : null;
+const TELEGRAM_REQUEST_TIMEOUT_MS = (() => {
+  const configured = Number(process.env.TELEGRAM_REQUEST_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured >= 50 && configured <= 60_000
+    ? Math.round(configured)
+    : 15_000;
+})();
+const TELEGRAM_POLL_TIMEOUT_SECONDS = 30;
+const TELEGRAM_POLL_ABORT_MS = 35_000;
 const ALLOWED_USER_IDS = new Set(
   String(process.env.TELEGRAM_ALLOWED_USER_IDS || "")
     .split(",")
@@ -19,6 +27,8 @@ let _polling = false;
 let _liveMessageDepth = 0;
 let _warnedMissingChatId = false;
 let _warnedMissingAllowedUsers = false;
+let _lastPollHttpError = null;
+let _lastPollHttpErrorAt = 0;
 
 function nonEmptyChatId(value) {
   if (value == null) return null;
@@ -103,6 +113,7 @@ async function postTelegram(method, body) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, ...body }),
+      signal: AbortSignal.timeout(TELEGRAM_REQUEST_TIMEOUT_MS),
     });
     if (!res.ok) {
       const err = await res.text();
@@ -118,7 +129,10 @@ async function postTelegram(method, body) {
     const message = e.message || "";
     const isExpectedFetchNoise = message === "fetch failed" && ["sendMessage", "sendChatAction", "editMessageText"].includes(method);
     if (!isExpectedFetchNoise) {
-      log("telegram_error", `${method} failed: ${message}`);
+      const timeout = e?.name === "TimeoutError" || /timed?\s*out/i.test(message);
+      log("telegram_error", timeout
+        ? `${method} timed out after ${TELEGRAM_REQUEST_TIMEOUT_MS}ms`
+        : `${method} failed: ${message}`);
     }
     return null;
   }
@@ -131,6 +145,7 @@ async function postTelegramRaw(method, body) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(TELEGRAM_REQUEST_TIMEOUT_MS),
     });
     if (!res.ok) {
       const err = await res.text();
@@ -146,7 +161,10 @@ async function postTelegramRaw(method, body) {
     const message = e.message || "";
     const isExpectedFetchNoise = message === "fetch failed" && ["answerCallbackQuery"].includes(method);
     if (!isExpectedFetchNoise) {
-      log("telegram_error", `${method} failed: ${message}`);
+      const timeout = e?.name === "TimeoutError" || /timed?\s*out/i.test(message);
+      log("telegram_error", timeout
+        ? `${method} timed out after ${TELEGRAM_REQUEST_TIMEOUT_MS}ms`
+        : `${method} failed: ${message}`);
     }
     return null;
   }
@@ -374,14 +392,33 @@ export async function createLiveMessage(title, intro = "Starting...") {
 
 
 // ─── Long polling ────────────────────────────────────────────────
+function logPollHttpError(status, body = "") {
+  const now = Date.now();
+  const detail = String(body || "").replace(/\s+/g, " ").trim().slice(0, 200);
+  const fingerprint = `${status}:${detail}`;
+  // A persistent 409 (another poller) or upstream 5xx must be visible without
+  // flooding the journal every five seconds.
+  if (fingerprint !== _lastPollHttpError || now - _lastPollHttpErrorAt >= 60_000) {
+    log("telegram_error", `getUpdates HTTP ${status}${detail ? `: ${detail}` : ""}`);
+    _lastPollHttpError = fingerprint;
+    _lastPollHttpErrorAt = now;
+  }
+}
+
 async function poll(onMessage) {
   while (_polling) {
     try {
       const res = await fetch(
-        `${BASE}/getUpdates?offset=${_offset}&timeout=30`,
-        { signal: AbortSignal.timeout(35_000) }
+        `${BASE}/getUpdates?offset=${_offset}&timeout=${TELEGRAM_POLL_TIMEOUT_SECONDS}`,
+        { signal: AbortSignal.timeout(TELEGRAM_POLL_ABORT_MS) }
       );
-      if (!res.ok) { await sleep(5000); continue; }
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        logPollHttpError(res.status, body);
+        await sleep(5000);
+        continue;
+      }
+      _lastPollHttpError = null;
       const data = await res.json();
       for (const update of data.result || []) {
         _offset = update.update_id + 1;
@@ -393,7 +430,7 @@ async function poll(onMessage) {
             text: callback.data,
           };
           if (!isAuthorizedIncomingMessage(callbackMsg)) continue;
-          await onMessage({
+          dispatchIncomingMessage(onMessage, {
             ...callbackMsg,
             isCallback: true,
             callbackQueryId: callback.id,
@@ -405,7 +442,7 @@ async function poll(onMessage) {
         const msg = update.message;
         if (!msg?.text) continue;
         if (!isAuthorizedIncomingMessage(msg)) continue;
-        await onMessage(msg);
+        dispatchIncomingMessage(onMessage, msg);
       }
     } catch (e) {
       const message = e.message || "";
@@ -417,9 +454,24 @@ async function poll(onMessage) {
   }
 }
 
-const BOT_COMMANDS = [
+/**
+ * Long polling must keep consuming and acknowledging Telegram updates while a
+ * prior command waits on an RPC/model provider. index.js owns the serialized
+ * command queue, so dispatching here is non-blocking without making financial
+ * commands concurrent.
+ */
+export function dispatchIncomingMessage(onMessage, message) {
+  if (typeof onMessage !== "function") throw new TypeError("Telegram message handler must be a function");
+  Promise.resolve()
+    .then(() => onMessage(message))
+    .catch((error) => log("telegram_error", `Message handler failed: ${error?.message || error}`));
+}
+
+export const BOT_COMMANDS = [
   { command: "help",       description: "Show commands" },
   { command: "status",     description: "Wallet + positions snapshot" },
+  { command: "breaker",    description: "Show circuit-breaker status" },
+  { command: "resumebreaker", description: "Resume entry breaker (confirm first)" },
   { command: "wallet",     description: "Wallet, deploy amount, HiveMind status" },
   { command: "positions",  description: "List open positions" },
   { command: "pool",       description: "Detailed info for one open position" },
@@ -451,6 +503,7 @@ async function registerCommands() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ commands: BOT_COMMANDS }),
+      signal: AbortSignal.timeout(TELEGRAM_REQUEST_TIMEOUT_MS),
     });
     log("telegram", "Bot commands registered");
   } catch (e) {

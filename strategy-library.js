@@ -46,7 +46,7 @@ const DEFAULT_STRATEGIES = {
     token_criteria: { notes: "Volatile tokens with strong narrative. Must have active volume." },
     entry: { condition: "Deploy token-only (amount_x only, amount_y=0) bid-ask, bins below active bin only", single_side: "token", notes: "As price drops through bins, token sold for SOL. Bid-ask concentrates at bottom edge." },
     range: { type: "default", bins_below_pct: 100, notes: "All bins below active bin. bins_above=0." },
-    exit: { notes: "When OOR downside: close_position(skip_swap=true) → redeploy token-only bid-ask at new lower price. Do NOT swap to SOL. Full close only when token dead or after N re-seeds with declining performance." },
+    exit: { notes: "When OOR downside: close_position → redeploy token-only bid-ask at new lower price. Closing does not swap wallet tokens. Full close only when token dead or after N re-seeds with declining performance." },
     best_for: "Riding volatile tokens down without cutting losses. DCA out via LP.",
   },
   fee_compounding: {

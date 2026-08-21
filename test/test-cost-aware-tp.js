@@ -20,5 +20,13 @@ assert.equal(getEffectiveTakeProfitPct({
   costAwareTakeProfitEnabled: false,
 }), 0.8);
 
+assert.equal(getEffectiveTakeProfitPct({
+  takeProfitPct: 0.5,
+  costAwareTakeProfitEnabled: true,
+  estimatedRoundTripCostPct: 0.4,
+  minNetProfitPct: 0.1,
+  takeProfitExecutionBufferPct: 0.75,
+}), 1.25, "rotation TP includes the additive execution uncertainty reserve");
+
 console.log("cost-aware take-profit tests passed");
 process.exit(0);

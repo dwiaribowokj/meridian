@@ -68,8 +68,12 @@ export function envryptDecrypt(value, key) {
 }
 
 export function loadEnv({ envPath = DEFAULT_ENV_PATH, keyPath = DEFAULT_KEY_PATH, override = true } = {}) {
-  // override=true so repo .env wins over stale PM2-injected env on restart
+  // Repository secrets/config normally win over stale process-manager state.
+  // A systemd-run service may deliberately supply an explicit RPC override
+  // after a provider outage; preserve only that narrow runtime failover input.
+  const runtimeRpcUrl = process.env.MERIDIAN_RUNTIME_RPC_URL;
   dotenv.config({ path: envPath, override, quiet: true });
+  if (runtimeRpcUrl) process.env.RPC_URL = runtimeRpcUrl;
 
   const encryptedKeys = parseEncryptedKeys(envPath);
   if (encryptedKeys.size === 0) return { encryptedKeys: [] };

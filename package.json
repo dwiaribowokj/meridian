@@ -19,6 +19,10 @@
     "test:syntax": "find . -path ./node_modules -prune -o -name '*.js' -exec node --check {} \\;",
     "test:screen": "node test/test-screening.js",
     "test:agent": "DRY_RUN=true node test/test-agent.js",
+    "rollout:replay": "node scripts/rollout-replay.js",
+    "rollout:acceptance": "node scripts/rollout-acceptance.js",
+    "test:rollout": "node test/test-rollout-safety.js && node test/test-wallet-balance-integrity.js && node test/test-rollout-replay.js && node test/test-shadow-lifecycle.js",
+    "test:rotation": "node test/test-shadow-rotation.js",
     "postinstall": "node scripts/patch-anchor.js"
   },
   "knip": {
@@ -28,6 +32,7 @@
   },
   "dependencies": {
     "@meteora-ag/dlmm": "1.9.4",
+    "@solana/spl-token": "^0.4.14",
     "@solana/web3.js": "^1.95.0",
     "bn.js": "^5.2.1",
     "bs58": "^5.0.0",

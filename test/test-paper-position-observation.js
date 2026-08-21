@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { trackPaperPosition, updatePaperPositionObservation } from "../state.js";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-paper-state-"));
 process.chdir(tmp);
 fs.mkdirSync("logs", { recursive: true });
+process.env.MERIDIAN_STATE_FILE = path.join(tmp, "state.json");
+
+const { trackPaperPosition, updatePaperPositionObservation } = await import("../state.js");
 
 const position = trackPaperPosition({
   pool: "pool-a",
@@ -26,9 +28,12 @@ let observed = updatePaperPositionObservation(position, {
   active_price: 0.011,
 });
 assert.equal(observed.price_change_source, "bin_step");
-assert.equal(observed.price_scale_warning, "price_scale_mismatch:2272.73x");
+assert.equal(observed.price_scale_warning, "price_scale_mismatch:2295.45x");
 assert.equal(observed.price_change_pct, 1);
 assert.equal(observed.status, "in_range");
+assert.equal(observed.last_active_price, 25.25);
+assert.equal(observed.last_active_price_raw, 0.011);
+assert.equal(observed.price_normalization_source, "bin_step");
 
 const noBinPosition = trackPaperPosition({
   pool: "pool-b",
@@ -54,4 +59,11 @@ observed = updatePaperPositionObservation(noBinPosition, {
 });
 assert.equal(observed.price_change_source, null);
 assert.equal(observed.price_scale_warning, "price_scale_mismatch:10000x");
+assert.equal(observed.price_change_pct, null);
+
+observed = updatePaperPositionObservation(noBinPosition, {
+  active_price: 1,
+});
+assert.equal(observed.price_change_source, null);
+assert.equal(observed.price_scale_warning, "price_scale_mismatch:10x");
 assert.equal(observed.price_change_pct, null);

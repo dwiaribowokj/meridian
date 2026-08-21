@@ -1,7 +1,7 @@
 import fs from "fs";
 import crypto from "crypto";
 import { log } from "./logger.js";
-import { config } from "./config.js";
+import { config, isRolloutBaselineLocked } from "./config.js";
 import { repoPath } from "./repo-root.js";
 
 const USER_CONFIG_PATH = repoPath("user-config.json");
@@ -78,15 +78,23 @@ function getPullMode() {
   return mode === "manual" ? "manual" : "auto";
 }
 
+function rolloutBaselineLocked() {
+  return isRolloutBaselineLocked();
+}
+
 export function getHiveMindPullMode() {
   return getPullMode();
 }
 
 export function isHiveMindEnabled() {
-  return !!(getBaseUrl() && getApiKey());
+  return !rolloutBaselineLocked() && config.hiveMind?.enabled !== false && !!(getBaseUrl() && getApiKey());
 }
 
 export function ensureAgentId() {
+  // Do not create a local identity (or write user-config) while the rollout
+  // baseline has HiveMind disabled. This keeps a shadow/canary startup from
+  // activating a side channel before the baseline is explicitly lifted.
+  if (rolloutBaselineLocked()) return config.hiveMind?.agentId || null;
   const userConfig = readUserConfig();
   if (userConfig.agentId) {
     config.hiveMind.agentId = userConfig.agentId;
@@ -149,6 +157,7 @@ function normalizeSharedLesson(lesson) {
 }
 
 export function getSharedLessonsForPrompt({ agentType = "GENERAL", maxLessons = 6 } = {}) {
+  if (!isHiveMindEnabled()) return null;
   const role = String(agentType || "GENERAL").toUpperCase();
   const shared = (readCache().sharedLessons || [])
     .map(normalizeSharedLesson)

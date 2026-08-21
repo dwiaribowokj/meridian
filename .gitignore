@@ -10,6 +10,12 @@ node_modules/
 # User config (contains RPC URL, wallet key, API keys)
 user-config.json
 
+# Local user-config copies and dated exports; keep the safe template trackable.
+user-config*.json
+user-config*.md
+user-config*.txt
+!user-config.example.json
+
 # GMGN fee-source config (contains API key)
 gmgn-config.json
 
@@ -27,6 +33,19 @@ decision-log.json
 hivemind-cache.json
 signal-weights.json
 candidate-observations.json
+circuit-breaker.json
+
+# Durable trading/runtime evidence (retain locally; never publish)
+/.meridian-lifecycle-operations/
+/shadow-rollout-evidence.jsonl
+/trade-ledger.jsonl
+
+# Local operator notes and generated learning-pass scratch files
+/.tmp_meridian_*.md
+/_learning_pass_*.md
+
+# Host-specific systemd units may contain absolute paths and RPC failovers.
+/systemd/*.service
 
 # Logs
 logs/
@@ -51,6 +70,19 @@ discord-signals.json
 
 # Local runtime artifacts
 *.log
+*.log.*
+*.log-*
+
+# Local source/config backups.
+*.bak
+*.bak-*
+*.bak.*
+*.backup*
+*.before-*.bak
+
+# Local agent recovery artifacts.
+/.openclaw-backups/
+/.trash/
 *.pid
 backups/
 meridian.md

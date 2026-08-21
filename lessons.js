@@ -10,10 +10,11 @@ import fs from "fs";
 import { log } from "./logger.js";
 import { getSharedLessonsForPrompt, pushHiveLesson, pushHivePerformanceEvent } from "./hivemind.js";
 import { repoPath } from "./repo-root.js";
+import { config } from "./config.js";
 
-const USER_CONFIG_PATH = repoPath("user-config.json");
+const USER_CONFIG_PATH = process.env.MERIDIAN_USER_CONFIG_FILE || repoPath("user-config.json");
 
-const LESSONS_FILE = repoPath("lessons.json");
+const LESSONS_FILE = process.env.MERIDIAN_LESSONS_FILE || repoPath("lessons.json");
 const MIN_EVOLVE_POSITIONS = 5;   // don't evolve until we have real data
 const MAX_CHANGE_PER_STEP  = 0.20; // never shift a threshold more than 20% at once
 const PERFORMANCE_SIGNAL_FIELDS = [
@@ -32,6 +33,15 @@ const PERFORMANCE_SIGNAL_FIELDS = [
   "entry_volume",
 ];
 const MAX_MANUAL_LESSON_LENGTH = 400;
+
+/**
+ * Baseline and canary evidence must not automatically change the lesson corpus
+ * or screening thresholds. Explicit operator lesson maintenance remains
+ * available, but no lesson is injected into an automated prompt while frozen.
+ */
+export function isLegacyLearningFrozen() {
+  return config.rollout?.learningFrozen === true || config.rollout?.mode !== "adaptive";
+}
 
 function sanitizeLessonText(text, maxLen = MAX_MANUAL_LESSON_LENGTH) {
   if (text == null) return null;
@@ -95,6 +105,9 @@ function buildSignalSnapshot(perf) {
  * @param {string} perf.close_reason   - Why it was closed
  */
 export async function recordPerformance(perf) {
+  if (isLegacyLearningFrozen()) {
+    return { recorded: false, frozen: true, reason: "ROLLOUT_BASELINE_LEARNING_FROZEN" };
+  }
   const data = load();
 
   // Guard against unit-mixed records where a SOL-sized final value is
@@ -233,6 +246,7 @@ export async function recordPerformance(perf) {
 }
 
 export async function updatePerformanceSolMetrics(position, metrics = {}) {
+  if (isLegacyLearningFrozen()) return false;
   if (!position) return false;
   const data = load();
   const entry = [...data.performance].reverse().find((item) => item.position === position);
@@ -370,6 +384,9 @@ function derivLesson(perf) {
  * @returns {{ changes: Object, rationale: Object } | null}
  */
 export function evolveThresholds(perfData, config) {
+  if (isLegacyLearningFrozen()) {
+    return { changes: {}, rationale: {}, frozen: true, reason: "ROLLOUT_BASELINE_LEARNING_FROZEN" };
+  }
   if (!perfData || perfData.length < MIN_EVOLVE_POSITIONS) return null;
 
   const winners = perfData.filter((p) => p.pnl_pct > 0);
@@ -522,7 +539,7 @@ function nudge(current, target, maxChange) {
  */
 export function addLesson(rule, tags = [], { pinned = false, role = null } = {}) {
   const safeRule = sanitizeLessonText(rule);
-  if (!safeRule) return;
+  if (!safeRule) return { added: false, frozen: false };
   const data = load();
   const lesson = {
     id: Date.now(),
@@ -537,7 +554,11 @@ export function addLesson(rule, tags = [], { pinned = false, role = null } = {})
   data.lessons.push(lesson);
   save(data);
   log("lessons", `Manual lesson added${pinned ? " [PINNED]" : ""}${role ? ` [${role}]` : ""}: ${safeRule}`);
-  void pushHiveLesson(lesson);
+  // Explicit local curation remains available while frozen, but propagating it
+  // into a shared prompt source would violate the rollout prompt-injection
+  // freeze.
+  if (!isLegacyLearningFrozen()) void pushHiveLesson(lesson);
+  return { added: true, frozen: false, id: lesson.id };
 }
 
 /**
@@ -617,6 +638,7 @@ export function clearAllLessons() {
  * Clear ALL performance records.
  */
 export function clearPerformance() {
+  if (isLegacyLearningFrozen()) return 0;
   const data = load();
   const count = data.performance.length;
   data.performance = [];
@@ -632,6 +654,15 @@ const ROLE_TAGS = {
   MANAGER:  ["management", "risk", "oor", "fees", "position", "hold", "close", "pnl", "rebalance", "claim"],
   GENERAL:  [], // all lessons
 };
+const PROMPT_AGENT_ROLES = new Set(["GENERAL", "MANAGER", "SCREENER"]);
+export const READ_ONLY_LESSON_ROLE = "READ_ONLY";
+
+export function resolveLessonPromptRole(agentType, roleArgumentProvided = false) {
+  if (!roleArgumentProvided) return "GENERAL";
+  return typeof agentType === "string" && PROMPT_AGENT_ROLES.has(agentType)
+    ? agentType
+    : READ_ONLY_LESSON_ROLE;
+}
 
 /**
  * Get lessons formatted for injection into the system prompt.
@@ -645,10 +676,16 @@ const ROLE_TAGS = {
  * @param {number} [opts.maxLessons] - Override total cap (default 35)
  */
 export function getLessonsForPrompt(opts = {}) {
+  if (config.darwin?.enabled === false || isLegacyLearningFrozen()) return null;
   // Support legacy call signature: getLessonsForPrompt(20)
   if (typeof opts === "number") opts = { maxLessons: opts };
 
-  const { agentType = "GENERAL", maxLessons } = opts;
+  const roleArgumentProvided = Object.hasOwn(opts, "agentType");
+  const agentType = resolveLessonPromptRole(opts.agentType, roleArgumentProvided);
+  const { maxLessons } = opts;
+  // An invalid role must not inherit GENERAL's all-lessons behavior. The
+  // caller still has the same READ_ONLY sentinel for prompt/tool/callbacks.
+  if (agentType === READ_ONLY_LESSON_ROLE) return null;
 
   const data = load();
   if (data.lessons.length === 0) return null;
@@ -768,6 +805,7 @@ export function getPerformanceHistory({ hours = 24, limit = 50 } = {}) {
  * Get performance stats summary.
  */
 export function getPerformanceSummary() {
+  if (config.darwin?.enabled === false || isLegacyLearningFrozen()) return null;
   const data = load();
   const p = data.performance;
 

@@ -70,8 +70,11 @@ function isLowYieldCloseReason(reason) {
   return String(reason || "").toLowerCase().includes("low yield");
 }
 
-function isStopLossCloseReason(reason) {
-  return String(reason || "").toLowerCase().includes("stop loss");
+export function isStopLossCloseReason(reason) {
+  const text = String(reason || "").toLowerCase();
+  return text.includes("stop loss") ||
+    text.includes("fee thesis failed") ||
+    text.includes("thesis_failure");
 }
 
 export function cleanNetPnlPct(deploy) {

@@ -42,6 +42,86 @@ function buildSignalSummary(payload) {
   };
 }
 
+function strictSupertrendState(summary = {}) {
+  const direction = String(summary.supertrendDirection || "unknown").trim().toLowerCase();
+  const bullish = summary.supertrendBreakUp === true ||
+    (direction === "bullish" && summary.close != null && summary.supertrendValue != null && summary.close >= summary.supertrendValue);
+  const bearish = summary.supertrendBreakDown === true ||
+    (direction === "bearish" && summary.close != null && summary.supertrendValue != null && summary.close <= summary.supertrendValue);
+  return { bullish, bearish };
+}
+
+/**
+ * Pure evaluator for the strict entry gate. Bullish Supertrend remains
+ * required, but a lower-only SOL range must not chase an already extended
+ * candle because any further rise immediately leaves that range above entry.
+ */
+export function evaluateStrictEntrySignals({
+  fiveMinute,
+  fifteenMinute,
+  rsiMin5m = config.indicators.entryRsiMin5m ?? 40,
+  rsiMin15m = config.indicators.entryRsiMin15m ?? 35,
+  rsiMax5m = config.indicators.entryRsiMax5m ?? 75,
+  rsiMax15m = config.indicators.entryRsiMax15m ?? 80,
+  rejectAboveUpperBand = config.indicators.entryRejectAboveUpperBand !== false,
+} = {}) {
+  const five = fiveMinute || {};
+  const fifteen = fifteenMinute || {};
+  const fiveTrend = strictSupertrendState(five);
+  const fifteenTrend = strictSupertrendState(fifteen);
+  const min5 = safeNum(rsiMin5m);
+  const min15 = safeNum(rsiMin15m);
+  const max5 = safeNum(rsiMax5m);
+  const max15 = safeNum(rsiMax15m);
+  const fiveRsiAvailable = five.rsi != null && min5 != null && max5 != null;
+  const fifteenRsiAvailable = fifteen.rsi != null && min15 != null && max15 != null;
+  const fiveBandAvailable = five.close != null && five.upperBand != null;
+  const fifteenBandAvailable = fifteen.close != null && fifteen.upperBand != null;
+  const fiveRsiUnrecovered = fiveRsiAvailable && five.rsi < min5;
+  const fifteenRsiUnrecovered = fifteenRsiAvailable && fifteen.rsi < min15;
+  const fiveRsiExtended = fiveRsiAvailable && five.rsi >= max5;
+  const fifteenRsiExtended = fifteenRsiAvailable && fifteen.rsi >= max15;
+  const fiveAboveUpperBand = rejectAboveUpperBand && fiveBandAvailable && five.close >= five.upperBand;
+  const fifteenAboveUpperBand = rejectAboveUpperBand && fifteenBandAvailable && fifteen.close >= fifteen.upperBand;
+  const failures = [];
+  if (!fiveTrend.bullish) failures.push("5m Supertrend not bullish");
+  if (fifteenTrend.bearish) failures.push("15m Supertrend bearish");
+  if (!fiveRsiAvailable) failures.push("5m RSI unavailable");
+  if (!fifteenRsiAvailable) failures.push("15m RSI unavailable");
+  if (rejectAboveUpperBand && !fiveBandAvailable) failures.push("5m Bollinger data unavailable");
+  if (rejectAboveUpperBand && !fifteenBandAvailable) failures.push("15m Bollinger data unavailable");
+  if (fiveRsiUnrecovered) failures.push(`5m RSI ${five.rsi} < recovery minimum ${min5}`);
+  if (fifteenRsiUnrecovered) failures.push(`15m RSI ${fifteen.rsi} < recovery minimum ${min15}`);
+  if (fiveRsiExtended) failures.push(`5m RSI ${five.rsi} >= ${max5}`);
+  if (fifteenRsiExtended) failures.push(`15m RSI ${fifteen.rsi} >= ${max15}`);
+  if (fiveAboveUpperBand) failures.push("5m close at/above upper Bollinger band");
+  if (fifteenAboveUpperBand) failures.push("15m close at/above upper Bollinger band");
+  const confirmed = failures.length === 0;
+  return {
+    confirmed,
+    reason: confirmed
+      ? "5m bullish, 15m non-bearish, RSI recovered, and no Bollinger chase condition"
+      : `Strict momentum failed: ${failures.join("; ")}`,
+    failures,
+    five: {
+      bullish: fiveTrend.bullish,
+      bearish: fiveTrend.bearish,
+      rsiRecovered: fiveRsiAvailable && !fiveRsiUnrecovered,
+      rsiExtended: fiveRsiExtended,
+      aboveUpperBand: fiveAboveUpperBand,
+      confirmed: fiveTrend.bullish && fiveRsiAvailable && (!rejectAboveUpperBand || fiveBandAvailable) && !fiveRsiUnrecovered && !fiveRsiExtended && !fiveAboveUpperBand,
+    },
+    fifteen: {
+      bullish: fifteenTrend.bullish,
+      bearish: fifteenTrend.bearish,
+      rsiRecovered: fifteenRsiAvailable && !fifteenRsiUnrecovered,
+      rsiExtended: fifteenRsiExtended,
+      aboveUpperBand: fifteenAboveUpperBand,
+      confirmed: !fifteenTrend.bearish && fifteenRsiAvailable && (!rejectAboveUpperBand || fifteenBandAvailable) && !fifteenRsiUnrecovered && !fifteenRsiExtended && !fifteenAboveUpperBand,
+    },
+  };
+}
+
 function evaluatePreset(side, preset, payload) {
   const summary = buildSignalSummary(payload);
   const oversold = Number(config.indicators.rsiOversold ?? 30);
@@ -294,6 +374,60 @@ export async function confirmIndicatorPreset({
     reason: confirmed
       ? `${preset} confirmed on ${successful.filter((entry) => entry.confirmed).map((entry) => entry.interval).join(", ")}`
       : `${preset} not confirmed on ${successful.map((entry) => entry.interval).join(", ")}`,
+    intervals: results,
+  };
+}
+
+/**
+ * Conservative entry gate used by the deterministic screener:
+ * - 5m must be bullish / break upward.
+ * - 15m must be available and must not be bearish.
+ * Missing data fails closed.
+ */
+export async function confirmStrictEntryMomentum({ mint, refresh = false } = {}) {
+  if (!config.indicators.enabled || !mint) {
+    return {
+      enabled: true,
+      confirmed: false,
+      skipped: false,
+      reason: "Strict entry momentum requires enabled indicators and a mint",
+      intervals: [],
+    };
+  }
+
+  const results = [];
+  for (const interval of ["5_MINUTE", "15_MINUTE"]) {
+    try {
+      const payload = await fetchChartIndicatorsForMint(mint, { interval, refresh });
+      const summary = buildSignalSummary(payload);
+      const trend = strictSupertrendState(summary);
+      results.push({ interval, ok: true, confirmed: false, bullish: trend.bullish, bearish: trend.bearish, signal: summary });
+    } catch (error) {
+      log("indicators_warn", `Strict indicator fetch failed for ${mint.slice(0, 8)} ${interval}: ${error.message}`);
+      results.push({ interval, ok: false, confirmed: false, reason: error.message, signal: null });
+    }
+  }
+
+  const five = results.find((entry) => entry.interval === "5_MINUTE");
+  const fifteen = results.find((entry) => entry.interval === "15_MINUTE");
+  const evaluation = evaluateStrictEntrySignals({
+    fiveMinute: five?.ok ? five.signal : null,
+    fifteenMinute: fifteen?.ok ? fifteen.signal : null,
+  });
+  if (five?.ok) five.confirmed = evaluation.five.confirmed;
+  if (fifteen?.ok) fifteen.confirmed = evaluation.fifteen.confirmed;
+  const confirmed = Boolean(five?.ok && fifteen?.ok && evaluation.confirmed);
+  return {
+    enabled: true,
+    confirmed,
+    skipped: false,
+    preset: "strict_supertrend_no_chase_entry",
+    side: "entry",
+    reason: confirmed
+      ? evaluation.reason
+      : !five?.ok || !fifteen?.ok
+        ? `Strict momentum failed: 5m=${five?.ok ? "available" : "unavailable"}, 15m=${fifteen?.ok ? "available" : "unavailable"}`
+        : evaluation.reason,
     intervals: results,
   };
 }
