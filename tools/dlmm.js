@@ -12,7 +12,11 @@ import {
 import BN from "bn.js";
 import bs58 from "bs58";
 import { config, computeDeployAmount, isEffectiveDryRun, MIN_SAFE_BINS_BELOW } from "../config.js";
-import { minimumBinsBelowForStrategyProfile, SHADOW_ROTATION_STRATEGY_PROFILE } from "../risk-policy.js";
+import {
+  isAuthorizedRotationRange,
+  minimumBinsBelowForStrategyProfile,
+  SHADOW_ROTATION_STRATEGY_PROFILE,
+} from "../risk-policy.js";
 import { log } from "../logger.js";
 import {
   trackPosition,
@@ -833,13 +837,39 @@ export async function deployPosition({
   const configuredUpperBuffer = Math.max(0, Number(config.strategy.upperBufferBins ?? 0));
   const upperBufferDryRunOnly = config.strategy.upperBufferDryRunOnly !== false;
   const requestedUpperBuffer = Math.max(Number(bins_above ?? 0), configuredUpperBuffer);
+  const strategyProfile = policy_snapshot?.strategyProfile ?? config.rollout.strategyProfile;
+  const authorizedRotationRange = isAuthorizedRotationRange({
+    effectiveDryRun: isEffectiveDryRun(),
+    effectiveRolloutMode: config.rollout.mode,
+    rotationEnabled: config.shadowRotation.enabled,
+    strategyProfile,
+    strategy: activeStrategy,
+    binsBelow: activeBinsBelow,
+    binsAbove: requestedUpperBuffer,
+    rotationStrategy: config.shadowRotation.strategy,
+    rotationBinsBelow: config.shadowRotation.binsBelow,
+    rotationBinsAbove: config.shadowRotation.binsAbove,
+  });
   if (isSingleSidedSol && Number(upside_pct ?? 0) > 0) {
     throw new Error(
       "Single-side SOL deploy cannot use upside_pct. Use bins_below and optional configured upperBufferBins only.",
     );
   }
   if (isSingleSidedSol) {
-    if (requestedUpperBuffer > 0 && upperBufferDryRunOnly && !isEffectiveDryRun()) {
+    if (
+      strategyProfile === SHADOW_ROTATION_STRATEGY_PROFILE &&
+      !authorizedRotationRange
+    ) {
+      throw new Error(
+        `Shadow rotation requires strategy ${config.shadowRotation.strategy} and exact range ${config.shadowRotation.binsBelow} below + ${config.shadowRotation.binsAbove} above.`,
+      );
+    }
+    if (
+      requestedUpperBuffer > 0 &&
+      upperBufferDryRunOnly &&
+      !isEffectiveDryRun() &&
+      !authorizedRotationRange
+    ) {
       throw new Error("upperBufferBins is currently dry-run only. Set upperBufferDryRunOnly=false only after paper validation.");
     }
     activeBinsAbove = requestedUpperBuffer;
@@ -850,7 +880,7 @@ export async function deployPosition({
     effectiveDryRun: isEffectiveDryRun(),
     effectiveRolloutMode: config.rollout.mode,
     rotationEnabled: config.shadowRotation.enabled,
-    strategyProfile: policy_snapshot?.strategyProfile ?? config.rollout.strategyProfile,
+    strategyProfile,
     rotationBinsBelow: config.shadowRotation.binsBelow,
     liveMinimumBinsBelow: Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW)),
   });
@@ -909,7 +939,6 @@ export async function deployPosition({
   });
   const effectiveStrategy = layerPlan.effectiveStrategy;
   const layerMetadata = layerPlan.layers.map(publicLayer);
-  const strategyProfile = policy_snapshot?.strategyProfile ?? config.rollout.strategyProfile;
   const fundingModel = strategyProfile === SHADOW_ROTATION_STRATEGY_PROFILE
     ? config.shadowRotation.fundingModel
     : "single_side_sol";

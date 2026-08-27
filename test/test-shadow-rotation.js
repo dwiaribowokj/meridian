@@ -16,6 +16,7 @@ const {
   evaluateCandidate,
   evaluateCandidateStability,
   evaluateEntryMomentum,
+  isAuthorizedRotationRange,
   minimumBinsBelowForStrategyProfile,
   resolveEntryStrategyProfile,
   SHADOW_ROTATION_POLICY,
@@ -325,17 +326,17 @@ assert.equal(minimumBinsBelowForStrategyProfile({
   effectiveDryRun: true,
   rotationEnabled: true,
   strategyProfile: SHADOW_ROTATION_STRATEGY_PROFILE,
-  rotationBinsBelow: 5,
+  rotationBinsBelow: 4,
   liveMinimumBinsBelow: 35,
-}), 5);
+}), 4);
 assert.equal(minimumBinsBelowForStrategyProfile({
   effectiveDryRun: false,
   effectiveRolloutMode: "canary",
   rotationEnabled: true,
   strategyProfile: SHADOW_ROTATION_STRATEGY_PROFILE,
-  rotationBinsBelow: 5,
+  rotationBinsBelow: 4,
   liveMinimumBinsBelow: 35,
-}), 5);
+}), 4);
 assert.equal(minimumBinsBelowForStrategyProfile({
   effectiveDryRun: false,
   effectiveRolloutMode: "dry_run",
@@ -344,6 +345,40 @@ assert.equal(minimumBinsBelowForStrategyProfile({
   rotationBinsBelow: 5,
   liveMinimumBinsBelow: 35,
 }), 35);
+
+const authorizedLiveRotationRange = {
+  effectiveDryRun: false,
+  effectiveRolloutMode: "canary",
+  rotationEnabled: true,
+  strategyProfile: SHADOW_ROTATION_STRATEGY_PROFILE,
+  strategy: "spot",
+  binsBelow: 4,
+  binsAbove: 1,
+  rotationStrategy: "spot",
+  rotationBinsBelow: 4,
+  rotationBinsAbove: 1,
+};
+assert.equal(isAuthorizedRotationRange(authorizedLiveRotationRange), true);
+assert.equal(isAuthorizedRotationRange({ ...authorizedLiveRotationRange, effectiveRolloutMode: "adaptive" }), false);
+assert.equal(isAuthorizedRotationRange({ ...authorizedLiveRotationRange, rotationEnabled: false }), false);
+assert.equal(isAuthorizedRotationRange({ ...authorizedLiveRotationRange, strategyProfile: YIELD_HOLD_STRATEGY_PROFILE }), false);
+assert.equal(isAuthorizedRotationRange({ ...authorizedLiveRotationRange, strategy: "bid_ask" }), false);
+assert.equal(isAuthorizedRotationRange({ ...authorizedLiveRotationRange, binsBelow: 5 }), false);
+assert.equal(isAuthorizedRotationRange({ ...authorizedLiveRotationRange, binsAbove: 0 }), false);
+assert.equal(isAuthorizedRotationRange({
+  ...authorizedLiveRotationRange,
+  binsBelow: 4,
+  binsAbove: 0,
+  rotationBinsBelow: 4,
+  rotationBinsAbove: 0,
+}), false, "a config-matching four-bin rotation range is still too narrow");
+assert.equal(isAuthorizedRotationRange({
+  ...authorizedLiveRotationRange,
+  binsBelow: 5,
+  binsAbove: 0,
+  rotationBinsBelow: 5,
+  rotationBinsAbove: 0,
+}), true, "the safe 5+0 rollback remains executable");
 assert.equal(minimumBinsBelowForStrategyProfile({
   effectiveDryRun: true,
   rotationEnabled: true,
@@ -360,12 +395,12 @@ const paperId = trackPaperPosition({
   base_mint: baseMint,
   strategy: "spot",
   funding_model: "single_side_sol",
-  bin_range: { min: 95, max: 100, bins_below: 5, bins_above: 0 },
+  bin_range: { min: 96, max: 101, bins_below: 4, bins_above: 1 },
   amount_sol: 0.2,
   active_bin: 100,
   active_price: 1,
-  min_price: 0.95,
-  max_price: 1,
+  min_price: 0.96,
+  max_price: 1.01,
   bin_step: 100,
   volatility: 3,
   fee_tvl_ratio: 1.98,
@@ -529,12 +564,12 @@ const tailId = trackPaperPosition({
   base_mint: tailMint,
   strategy: "spot",
   funding_model: "single_side_sol",
-  bin_range: { min: 95, max: 100, bins_below: 5, bins_above: 0 },
+  bin_range: { min: 96, max: 101, bins_below: 4, bins_above: 1 },
   amount_sol: 0.2,
   active_bin: 100,
   active_price: 1,
-  min_price: 0.95,
-  max_price: 1,
+  min_price: 0.96,
+  max_price: 1.01,
   bin_step: 100,
   volatility: 2,
   fee_tvl_ratio: 0.6,
@@ -566,12 +601,12 @@ const thesisPaperId = trackPaperPosition({
   base_mint: thesisMint,
   strategy: "spot",
   funding_model: "single_side_sol",
-  bin_range: { min: 95, max: 100, bins_below: 5, bins_above: 0 },
+  bin_range: { min: 96, max: 101, bins_below: 4, bins_above: 1 },
   amount_sol: 0.2,
   active_bin: 100,
   active_price: 1,
-  min_price: 0.95,
-  max_price: 1,
+  min_price: 0.96,
+  max_price: 1.01,
   bin_step: 100,
   volatility: 2,
   fee_tvl_ratio: 0.1,

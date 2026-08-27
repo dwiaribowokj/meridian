@@ -39,6 +39,7 @@ circuit-breaker.json
 /.meridian-lifecycle-operations/
 /shadow-rollout-evidence.jsonl
 /trade-ledger.jsonl
+/rejected-candidate-evidence.jsonl
 
 # Local operator notes and generated learning-pass scratch files
 /.tmp_meridian_*.md
@@ -72,6 +73,7 @@ discord-signals.json
 *.log
 *.log.*
 *.log-*
+.meridian-live.lock
 
 # Local source/config backups.
 *.bak

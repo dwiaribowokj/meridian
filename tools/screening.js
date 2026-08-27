@@ -5,6 +5,7 @@ import { log } from "../logger.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { isShadowBaseMintOnCooldown, isShadowPoolOnCooldown } from "../state.js";
 import { confirmIndicatorPreset, confirmStrictEntryMomentum } from "./chart-indicators.js";
+import { appendCandidateObservations, buildCandidateObservation } from "./rejected-candidate-evidence.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { candidatePolicyFromScreening } from "../risk-policy.js";
 
@@ -828,15 +829,31 @@ export async function discoverPools({
   rawPools = await applyVolatilityTimeframe(rawPools, s.timeframe);
   await enrichDiscordSignalLaunchpads(rawPools);
 
+  const observationTs = new Date().toISOString();
+  const candidateObservations = [];
   const filteredExamples = [];
   const thresholdedRawPools = rawPools.filter((pool) => {
     const reasons = getRawPoolScreeningRejectReasons(pool, s);
+    candidateObservations.push(buildCandidateObservation(pool, { ts: observationTs, reasons }));
     if (reasons.length === 0) return true;
     const reason = reasons.join("; ");
-    filteredExamples.push({ name: pool.name || pool.pool_address || "unknown pool", reason, reasons });
+    filteredExamples.push({
+      name: pool.name || pool.pool_address || "unknown pool",
+      pool: pool.pool_address || null,
+      base_mint: pool.token_x?.address || null,
+      price: numeric(pool.pool_price),
+      volatility: numeric(pool.volatility),
+      reason,
+      reasons,
+    });
     if (pool.discord_signal) log("screening", `Discord signal filtered: ${pool.name || pool.pool_address} — ${reason}`);
     return false;
   });
+  try {
+    appendCandidateObservations(candidateObservations);
+  } catch (error) {
+    log("screening", `Rejected-candidate evidence append failed: ${error.message}`);
+  }
 
   if (filteredExamples.length === 0 && nearMissExamples.length > 0) {
     filteredExamples.push(...nearMissExamples.map((entry) => ({
@@ -1219,6 +1236,11 @@ function pushFilteredReason(list, pool, reason) {
   if (!list || !pool) return;
   list.push({
     name: pool.name || `${pool.base?.symbol || "?"}-${pool.quote?.symbol || "?"}`,
+    pool: pool.pool || pool.pool_address || null,
+    base_mint: pool.base?.mint || pool.token_x?.address || null,
+    price: numeric(pool.price ?? pool.pool_price),
+    volatility: numeric(pool.volatility),
     reason,
+    reasons: [reason],
   });
 }

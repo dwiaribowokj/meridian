@@ -40,6 +40,7 @@ import {
   calculateAdaptiveSizing,
   candidatePolicyFromScreening,
   evaluateCandidate,
+  isAuthorizedRotationRange,
   minimumBinsBelowForStrategyProfile,
   SHADOW_ROTATION_STRATEGY_PROFILE,
 } from "../risk-policy.js";
@@ -2599,6 +2600,18 @@ async function runSafetyChecks(name, args, dependencies = {}) {
       });
       const isSingleSidedSol = deployAmountY > 0 && deployAmountX <= 0;
       const requestedTotalBins = requestedBinsBelow + requestedBinsAbove;
+      const authorizedRotationRange = isAuthorizedRotationRange({
+        effectiveDryRun: isEffectiveDryRun(),
+        effectiveRolloutMode: config.rollout.mode,
+        rotationEnabled: config.shadowRotation.enabled,
+        strategyProfile,
+        strategy: args.strategy,
+        binsBelow: requestedBinsBelow,
+        binsAbove: requestedBinsAbove,
+        rotationStrategy: config.shadowRotation.strategy,
+        rotationBinsBelow: config.shadowRotation.binsBelow,
+        rotationBinsAbove: config.shadowRotation.binsAbove,
+      });
       const requestedVolatility = args.volatility == null ? null : Number(args.volatility);
       if (args.volatility != null && (!Number.isFinite(requestedVolatility) || requestedVolatility <= 0)) {
         return {
@@ -2646,6 +2659,15 @@ async function runSafetyChecks(name, args, dependencies = {}) {
         };
       }
       if (
+        strategyProfile === SHADOW_ROTATION_STRATEGY_PROFILE &&
+        !authorizedRotationRange
+      ) {
+        return {
+          pass: false,
+          reason: "Shadow rotation range does not satisfy the locked executable contract (at least 4 bins below and 5 total bins).",
+        };
+      }
+      if (
         isSingleSidedSol &&
         args.downside_pct == null &&
         (!Number.isFinite(requestedBinsBelow) || !Number.isInteger(requestedBinsBelow) || requestedBinsBelow < minBinsBelow)
@@ -2669,7 +2691,8 @@ async function runSafetyChecks(name, args, dependencies = {}) {
         isSingleSidedSol &&
         requestedBinsAbove > 0 &&
         config.strategy.upperBufferDryRunOnly !== false &&
-        !isEffectiveDryRun()
+        !isEffectiveDryRun() &&
+        !authorizedRotationRange
       ) {
         return {
           pass: false,

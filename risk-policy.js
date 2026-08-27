@@ -125,8 +125,47 @@ export function minimumBinsBelowForStrategyProfile({
   }
   const requested = Math.round(Number(rotationBinsBelow));
   return Number.isFinite(requested)
-    ? Math.max(5, Math.min(liveMinimum, requested))
+    ? Math.max(SHADOW_ROTATION_POLICY.binsBelow, Math.min(liveMinimum, requested))
     : SHADOW_ROTATION_POLICY.binsBelow;
+}
+
+/**
+ * Match the complete versioned rotation contract. The narrow 4+1 range is an
+ * exception to the generic live lower-range floor, so callers must prove the
+ * active rollout stage, profile, strategy, and both range sides together.
+ */
+export function isAuthorizedRotationRange({
+  effectiveDryRun = false,
+  effectiveRolloutMode = effectiveDryRun === true ? "dry_run" : null,
+  rotationEnabled = false,
+  strategyProfile = null,
+  strategy = null,
+  binsBelow = null,
+  binsAbove = null,
+  rotationStrategy = SHADOW_ROTATION_POLICY.strategy,
+  rotationBinsBelow = SHADOW_ROTATION_POLICY.binsBelow,
+  rotationBinsAbove = SHADOW_ROTATION_POLICY.binsAbove,
+} = {}) {
+  const rotationStageAuthorized = effectiveDryRun === true || effectiveRolloutMode === "canary";
+  const requestedBelow = Number(binsBelow);
+  const requestedAbove = Number(binsAbove);
+  const requiredBelow = Number(rotationBinsBelow);
+  const requiredAbove = Number(rotationBinsAbove);
+  const minimumRotationBelow = SHADOW_ROTATION_POLICY.binsBelow;
+  const minimumRotationTotal = SHADOW_ROTATION_POLICY.binsBelow + SHADOW_ROTATION_POLICY.binsAbove;
+  return rotationStageAuthorized === true &&
+    rotationEnabled === true &&
+    strategyProfile === SHADOW_ROTATION_STRATEGY_PROFILE &&
+    String(strategy || "").trim() === String(rotationStrategy || "").trim() &&
+    Number.isInteger(requestedBelow) &&
+    Number.isInteger(requestedAbove) &&
+    Number.isInteger(requiredBelow) &&
+    Number.isInteger(requiredAbove) &&
+    requestedBelow >= minimumRotationBelow &&
+    requestedAbove >= 0 &&
+    requestedBelow + requestedAbove >= minimumRotationTotal &&
+    requestedBelow === requiredBelow &&
+    requestedAbove === requiredAbove;
 }
 
 // Keep entry admission aligned with the conservative paper valuation. These

@@ -10,7 +10,7 @@
   "scripts": {
     "setup": "node setup.js",
     "env:encrypt": "node scripts/envrypt.js encrypt",
-    "start": "node index.js",
+    "start": "/usr/bin/flock --exclusive --nonblock --conflict-exit-code 75 /home/wiee/meridian/.meridian-live.lock /usr/bin/node index.js",
     "pm2:start": "pm2 start ecosystem.config.cjs",
     "pm2:restart": "pm2 restart meridian --update-env",
     "pm2:logs": "pm2 logs meridian --lines 100",
@@ -20,8 +20,9 @@
     "test:screen": "node test/test-screening.js",
     "test:agent": "DRY_RUN=true node test/test-agent.js",
     "rollout:replay": "node scripts/rollout-replay.js",
+    "rejected:replay": "node scripts/rejected-candidate-replay.js",
     "rollout:acceptance": "node scripts/rollout-acceptance.js",
-    "test:rollout": "node test/test-rollout-safety.js && node test/test-wallet-balance-integrity.js && node test/test-rollout-replay.js && node test/test-shadow-lifecycle.js",
+    "test:rollout": "node test/test-rollout-safety.js && node test/test-wallet-balance-integrity.js && node test/test-rollout-replay.js && node test/test-shadow-lifecycle.js && node test/test-rejected-candidate-replay.js",
     "test:rotation": "node test/test-shadow-rotation.js",
     "postinstall": "node scripts/patch-anchor.js"
   },
