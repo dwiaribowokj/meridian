@@ -844,11 +844,16 @@ export async function deployPosition({
     rotationEnabled: config.shadowRotation.enabled,
     strategyProfile,
     strategy: activeStrategy,
-    binsBelow: activeBinsBelow,
-    binsAbove: requestedUpperBuffer,
-    rotationStrategy: config.shadowRotation.strategy,
-    rotationBinsBelow: config.shadowRotation.binsBelow,
-    rotationBinsAbove: config.shadowRotation.binsAbove,
+  binsBelow: activeBinsBelow,
+  binsAbove: requestedUpperBuffer,
+  volatility: normalizedVolatility,
+  rotationStrategy: config.shadowRotation.strategy,
+  rotationBinsBelow: config.shadowRotation.binsBelow,
+  rotationBinsAbove: config.shadowRotation.binsAbove,
+  rotationMediumVolatilityMin: config.shadowRotation.mediumVolatilityMin,
+  rotationMediumBinsBelow: config.shadowRotation.mediumVolatilityBinsBelow,
+  rotationMediumBinsAbove: config.shadowRotation.mediumVolatilityBinsAbove,
+  rotationMaxVolatilityExclusive: config.shadowRotation.maxVolatilityExclusive,
   });
   if (isSingleSidedSol && Number(upside_pct ?? 0) > 0) {
     throw new Error(
@@ -861,7 +866,7 @@ export async function deployPosition({
       !authorizedRotationRange
     ) {
       throw new Error(
-        `Shadow rotation requires strategy ${config.shadowRotation.strategy} and exact range ${config.shadowRotation.binsBelow} below + ${config.shadowRotation.binsAbove} above.`,
+        `Shadow rotation range ${activeBinsBelow}+${requestedUpperBuffer} is not authorized for volatility ${normalizedVolatility}.`,
       );
     }
     if (
@@ -1814,7 +1819,10 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
           Array.isArray(rpcResult.positions) &&
           rpcResult.positions.length > 0 &&
           rpcResult.positions.every((p) => p.pnl_pct_suspicious);
-        if (allPnlSuspicious) {
+        const executableQuoteUnavailable = rpcResult.positions?.some((position) =>
+          position.pnl_executable_quote_required === true &&
+          position.pnl_executable_quote_available !== true);
+        if (allPnlSuspicious && !executableQuoteUnavailable) {
           rpcResultForFallback = rpcResult;
           log("positions_warn", `RPC PnL path returned ${rpcResult.positions.length} suspicious tick(s); falling back to Meteora portfolio API`);
         } else {

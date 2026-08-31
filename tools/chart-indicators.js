@@ -5,6 +5,10 @@ import { safeNumber } from "../utils/number.js";
 
 const DEFAULT_INTERVALS = ["5_MINUTE"];
 const DEFAULT_CANDLES = 298;
+const MAX_CACHE_ENTRIES = 128;
+const indicatorCache = new Map();
+const indicatorRequests = new Map();
+const fallbackLogTimes = new Map();
 
 function normalizeIntervals(intervals) {
   const list = Array.isArray(intervals) ? intervals : DEFAULT_INTERVALS;
@@ -15,6 +19,77 @@ function normalizeIntervals(intervals) {
 
 function safeNum(value) {
   return safeNumber(value, null);
+}
+
+function intervalCacheMs(interval, kind) {
+  const isFifteenMinute = interval === "15_MINUTE";
+  const key = kind === "stale"
+    ? (isFifteenMinute ? "staleIfError15mSec" : "staleIfError5mSec")
+    : (isFifteenMinute ? "cacheTtl15mSec" : "cacheTtl5mSec");
+  const fallback = kind === "stale"
+    ? (isFifteenMinute ? 180 : 90)
+    : (isFifteenMinute ? 120 : 60);
+  const seconds = safeNum(config.indicators[key]);
+  return Math.max(0, seconds ?? fallback) * 1000;
+}
+
+function cacheKey(mint, interval, candles, rsiLength) {
+  return `${mint}:${interval}:${candles}:${rsiLength}`;
+}
+
+function cacheableIndicatorPayload(payload) {
+  const summary = buildSignalSummary(payload);
+  return summary.close != null &&
+    summary.previousClose != null &&
+    summary.rsi != null &&
+    summary.lowerBand != null &&
+    summary.upperBand != null;
+}
+
+function readIndicatorCache(key, maxAgeMs, nowMs = Date.now()) {
+  const cached = indicatorCache.get(key);
+  if (!cached || maxAgeMs <= 0 || nowMs - cached.fetchedAtMs > maxAgeMs) return null;
+  indicatorCache.delete(key);
+  indicatorCache.set(key, cached);
+  return cached;
+}
+
+function writeIndicatorCache(key, payload, fetchedAtMs = Date.now()) {
+  indicatorCache.delete(key);
+  indicatorCache.set(key, { payload, fetchedAtMs });
+  while (indicatorCache.size > MAX_CACHE_ENTRIES) {
+    indicatorCache.delete(indicatorCache.keys().next().value);
+  }
+}
+
+function isTransientIndicatorError(error) {
+  const status = Number(error?.status || 0);
+  if ([408, 425, 429].includes(status) || status >= 500) return true;
+  const message = String(error?.message || "").toLowerCase();
+  return error?.name === "AbortError" ||
+    message.includes("429") ||
+    message.includes("too many requests") ||
+    message.includes("fetch failed") ||
+    message.includes("error sending request") ||
+    message.includes("timeout") ||
+    message.includes("timed out") ||
+    message.includes("network");
+}
+
+function logCachedFallback(key, mint, interval, ageMs, error, nowMs = Date.now()) {
+  const lastLoggedAt = fallbackLogTimes.get(key) || 0;
+  if (nowMs - lastLoggedAt < 60_000) return;
+  fallbackLogTimes.set(key, nowMs);
+  log(
+    "indicators_warn",
+    `Using ${Math.ceil(ageMs / 1000)}s cached indicators for ${mint.slice(0, 8)} ${interval} after transient fetch failure: ${error.message}`,
+  );
+}
+
+export function clearChartIndicatorCache() {
+  indicatorCache.clear();
+  indicatorRequests.clear();
+  fallbackLogTimes.clear();
 }
 
 function buildSignalSummary(payload) {
@@ -282,7 +357,7 @@ function evaluatePreset(side, preset, payload) {
   }
 }
 
-async function fetchChartIndicatorsForMint(
+export async function fetchChartIndicatorsForMint(
   mint,
   {
     interval,
@@ -292,16 +367,45 @@ async function fetchChartIndicatorsForMint(
   } = {},
 ) {
   const normalizedInterval = String(interval || "15_MINUTE").trim().toUpperCase();
+  const normalizedCandles = Math.max(1, Number(candles) || DEFAULT_CANDLES);
+  const normalizedRsiLength = Math.max(2, Number(rsiLength) || 2);
+  const key = cacheKey(mint, normalizedInterval, normalizedCandles, normalizedRsiLength);
+  const nowMs = Date.now();
+  if (!refresh) {
+    const cached = readIndicatorCache(key, intervalCacheMs(normalizedInterval, "fresh"), nowMs);
+    if (cached) return cached.payload;
+  }
+
+  const inFlight = indicatorRequests.get(key);
+  if (inFlight) return inFlight;
+
   const search = new URLSearchParams({
     interval: normalizedInterval,
-    candles: String(candles),
-    rsiLength: String(rsiLength),
+    candles: String(normalizedCandles),
+    rsiLength: String(normalizedRsiLength),
   });
   if (refresh) search.set("refresh", "1");
 
-  return agentMeridianJson(`/chart-indicators/${mint}?${search.toString()}`, {
-    headers: getAgentMeridianHeaders(),
-  });
+  const request = (async () => {
+    try {
+      const payload = await agentMeridianJson(`/chart-indicators/${mint}?${search.toString()}`, {
+        headers: getAgentMeridianHeaders(),
+      });
+      if (cacheableIndicatorPayload(payload)) writeIndicatorCache(key, payload);
+      return payload;
+    } catch (error) {
+      const cached = isTransientIndicatorError(error)
+        ? readIndicatorCache(key, intervalCacheMs(normalizedInterval, "stale"))
+        : null;
+      if (!cached) throw error;
+      logCachedFallback(key, mint, normalizedInterval, Date.now() - cached.fetchedAtMs, error);
+      return cached.payload;
+    } finally {
+      indicatorRequests.delete(key);
+    }
+  })();
+  indicatorRequests.set(key, request);
+  return request;
 }
 
 export async function confirmIndicatorPreset({

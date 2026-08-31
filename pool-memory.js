@@ -11,8 +11,9 @@ import { config } from "./config.js";
 
 import { repoPath } from "./repo-root.js";
 
-const POOL_MEMORY_FILE = repoPath("pool-memory.json");
+const POOL_MEMORY_FILE = process.env.MERIDIAN_POOL_MEMORY_FILE || repoPath("pool-memory.json");
 const MAX_NOTE_LENGTH = 280;
+const LEGACY_STOP_COOLDOWN_REASON = "bad outcome: stop loss";
 
 function sanitizeStoredNote(text, maxLen = MAX_NOTE_LENGTH) {
   if (text == null) return null;
@@ -25,17 +26,19 @@ function sanitizeStoredNote(text, maxLen = MAX_NOTE_LENGTH) {
   return cleaned || null;
 }
 
-function load() {
-  if (!fs.existsSync(POOL_MEMORY_FILE)) return {};
+function load(filePath = POOL_MEMORY_FILE) {
+  if (!fs.existsSync(filePath)) return {};
   try {
-    return JSON.parse(fs.readFileSync(POOL_MEMORY_FILE, "utf8"));
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
   } catch {
     return {};
   }
 }
 
-function save(data) {
-  fs.writeFileSync(POOL_MEMORY_FILE, JSON.stringify(data, null, 2));
+function save(data, filePath = POOL_MEMORY_FILE) {
+  const tmp = `${filePath}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.renameSync(tmp, filePath);
 }
 
 function isOorCloseReason(reason) {
@@ -51,8 +54,8 @@ function isAdjustedWinRateExcludedReason(reason) {
     text.includes("oor");
 }
 
-function isFeeGeneratingDeploy(deploy) {
-  const minFeeEarnedPct = Number(config.management.repeatDeployCooldownMinFeeEarnedPct ?? 0);
+function isFeeGeneratingDeploy(deploy, management = config.management) {
+  const minFeeEarnedPct = Number(management.repeatDeployCooldownMinFeeEarnedPct ?? 0);
   const feeEarnedPct = Number(deploy.fee_earned_pct ?? 0);
   const feesUsd = Number(deploy.fees_earned_usd ?? 0);
   const feesSol = Number(deploy.fees_earned_sol ?? 0);
@@ -137,40 +140,142 @@ export function getPoolMemoryPolicy(entry, now = Date.now()) {
   return "MEMORY POLICY: no active cooldown; historical low-yield/OOR outcomes are advisory only. Judge the new entry on current clean-net evidence, fee/TVL, volume, and momentum.";
 }
 
-function setPoolCooldown(entry, hours, reason) {
-  const cooldownUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
-  entry.cooldown_until = cooldownUntil;
-  entry.cooldown_reason = reason;
-  return cooldownUntil;
+function setPoolCooldown(entry, hours, reason, nowMs = Date.now()) {
+  const cooldownUntil = new Date(nowMs + hours * 60 * 60 * 1000).toISOString();
+  const existingUntilMs = Date.parse(entry.cooldown_until);
+  if (!Number.isFinite(existingUntilMs) || existingUntilMs < Date.parse(cooldownUntil)) {
+    entry.cooldown_until = cooldownUntil;
+    entry.cooldown_reason = reason;
+  }
+  return entry.cooldown_until;
 }
 
-function setBaseMintCooldown(db, baseMint, hours, reason) {
+function setBaseMintCooldown(db, baseMint, hours, reason, nowMs = Date.now()) {
   if (!baseMint) return null;
-  const cooldownUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+  const cooldownUntil = new Date(nowMs + hours * 60 * 60 * 1000).toISOString();
+  let longestUntil = cooldownUntil;
   for (const entry of Object.values(db)) {
     if (entry?.base_mint === baseMint) {
-      entry.base_mint_cooldown_until = cooldownUntil;
-      entry.base_mint_cooldown_reason = reason;
+      const existingUntilMs = Date.parse(entry.base_mint_cooldown_until);
+      if (!Number.isFinite(existingUntilMs) || existingUntilMs < Date.parse(cooldownUntil)) {
+        entry.base_mint_cooldown_until = cooldownUntil;
+        entry.base_mint_cooldown_reason = reason;
+      }
+      if (Date.parse(entry.base_mint_cooldown_until) > Date.parse(longestUntil)) {
+        longestUntil = entry.base_mint_cooldown_until;
+      }
     }
   }
-  return cooldownUntil;
+  return longestUntil;
 }
 
-function setScopedCooldown(db, entry, hours, reason, scope) {
+function setScopedCooldown(db, entry, hours, reason, scope, nowMs = Date.now()) {
   const cooldownHours = Math.max(0, Number(hours ?? 0));
   if (cooldownHours <= 0) return;
 
   const resolvedScope = cooldownScope(scope, "token");
   if (resolvedScope === "pool" || resolvedScope === "both" || !entry.base_mint) {
-    const poolCooldownUntil = setPoolCooldown(entry, cooldownHours, reason);
+    const poolCooldownUntil = setPoolCooldown(entry, cooldownHours, reason, nowMs);
     log("pool-memory", `Cooldown set for ${entry.name} until ${poolCooldownUntil} (${reason})`);
   }
   if ((resolvedScope === "token" || resolvedScope === "both") && entry.base_mint) {
-    const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, cooldownHours, reason);
+    const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, cooldownHours, reason, nowMs);
     if (mintCooldownUntil) {
       log("pool-memory", `Base mint cooldown set for ${entry.base_mint.slice(0, 8)} until ${mintCooldownUntil} (${reason})`);
     }
   }
+}
+
+function reconcileLegacyTokenStopCooldown(db, entry, {
+  cooldownUntil = null,
+  cooldownReason = null,
+} = {}) {
+  if (!entry?.base_mint || entry.base_mint_cooldown_reason !== LEGACY_STOP_COOLDOWN_REASON) {
+    return false;
+  }
+  const linkedUntil = entry.base_mint_cooldown_until;
+  let changed = false;
+  for (const candidate of Object.values(db)) {
+    if (
+      candidate?.base_mint === entry.base_mint &&
+      candidate.base_mint_cooldown_reason === LEGACY_STOP_COOLDOWN_REASON &&
+      candidate.base_mint_cooldown_until === linkedUntil
+    ) {
+      if (cooldownUntil && cooldownReason) {
+        candidate.base_mint_cooldown_until = cooldownUntil;
+        candidate.base_mint_cooldown_reason = cooldownReason;
+      } else {
+        delete candidate.base_mint_cooldown_until;
+        delete candidate.base_mint_cooldown_reason;
+      }
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function reconcileAuthoritativeSettlementCooldown(db, entry, deploy, management, nowMs) {
+  if (deploy?.authoritative_settlement !== true || !isStopLossCloseReason(deploy.close_reason)) {
+    return false;
+  }
+  const latest = entry?.deploys?.at(-1);
+  if (!latest || latest.settlement_id !== deploy.settlement_id) return false;
+
+  const netPct = Number(deploy.position_sol_pnl_pct ?? deploy.pnl_pct);
+  if (!Number.isFinite(netPct)) return false;
+  const smallLossFloorPct = Math.min(0, Number(management.settlementSmallLossFloorPct ?? -0.75));
+  const isSmallLoss = netPct < 0 && netPct >= smallLossFloorPct;
+  const isNonLoss = netPct >= 0;
+  if (!isSmallLoss && !isNonLoss) return false;
+
+  let changed = false;
+  if (isNonLoss) {
+    changed = reconcileLegacyTokenStopCooldown(db, entry) || changed;
+    if (entry.cooldown_reason === LEGACY_STOP_COOLDOWN_REASON) {
+      delete entry.cooldown_until;
+      delete entry.cooldown_reason;
+      changed = true;
+    }
+    return changed;
+  }
+
+  const cooldownMinutes = Math.max(0, Number(management.settlementSmallLossCooldownMinutes ?? 60));
+  const scope = cooldownScope(management.settlementSmallLossCooldownScope, "pool");
+  const expectedUntil = new Date(nowMs + cooldownMinutes * 60_000).toISOString();
+  const expectedReason = `small authoritative stop ${netPct.toFixed(3)}%`;
+  const poolScoped = scope === "pool" || scope === "both" || !entry.base_mint;
+  const tokenScoped = (scope === "token" || scope === "both") && entry.base_mint;
+  changed = reconcileLegacyTokenStopCooldown(db, entry, tokenScoped ? {
+    cooldownUntil: expectedUntil,
+    cooldownReason: expectedReason,
+  } : {}) || changed;
+  const replaceablePoolCooldown = !entry.cooldown_until ||
+    entry.cooldown_reason === LEGACY_STOP_COOLDOWN_REASON ||
+    String(entry.cooldown_reason || "").startsWith("small authoritative stop ");
+  if (poolScoped && replaceablePoolCooldown && (
+    entry.cooldown_until !== expectedUntil || entry.cooldown_reason !== expectedReason
+  )) {
+    entry.cooldown_until = expectedUntil;
+    entry.cooldown_reason = expectedReason;
+    changed = true;
+  } else if (!poolScoped && replaceablePoolCooldown && entry.cooldown_until) {
+    delete entry.cooldown_until;
+    delete entry.cooldown_reason;
+    changed = true;
+  }
+  if (
+    deploy.cooldown?.scope !== scope ||
+    deploy.cooldown?.minutes !== cooldownMinutes ||
+    deploy.cooldown?.reason !== "small authoritative settled loss"
+  ) {
+    deploy.cooldown = {
+      scope,
+      minutes: cooldownMinutes,
+      reason: "small authoritative settled loss",
+    };
+    changed = true;
+  }
+  return changed;
 }
 
 // ─── Write ─────────────────────────────────────────────────────
@@ -193,10 +298,19 @@ function setScopedCooldown(db, entry, hours, reason, scope) {
  * @param {string} deployData.strategy
  * @param {number} deployData.volatility
  */
-export function recordPoolDeploy(poolAddress, deployData) {
-  if (!poolAddress) return;
+export function recordPoolDeploy(poolAddress, deployData, {
+  storagePath = POOL_MEMORY_FILE,
+  nowMs = Date.now(),
+  policy = {},
+} = {}) {
+  if (!poolAddress) return { recorded: false, reason: "pool address missing" };
 
-  const db = load();
+  const db = load(storagePath);
+  // Tests and recovery jobs can supply one deterministic policy snapshot, but
+  // ordinary runtime callers continue to inherit the active management
+  // policy. Keeping the snapshot local also prevents a settlement retry from
+  // mutating global config.
+  const management = { ...config.management, ...policy };
 
   if (!db[poolAddress]) {
     db[poolAddress] = {
@@ -215,11 +329,50 @@ export function recordPoolDeploy(poolAddress, deployData) {
   }
 
   const entry = db[poolAddress];
+  if (deployData.base_mint && !entry.base_mint) entry.base_mint = deployData.base_mint;
+  if (deployData.pool_name && (
+    !entry.name || entry.name === poolAddress.slice(0, 8) || /^\?[/_-]/.test(entry.name)
+  )) {
+    entry.name = deployData.pool_name;
+  }
+  const settlementId = sanitizeStoredNote(deployData.settlement_id, 500);
+  if (settlementId) {
+    const existing = entry.deploys.find((item) => item.settlement_id === settlementId);
+    if (existing) {
+      const cooldownMigrated = reconcileAuthoritativeSettlementCooldown(
+        db,
+        entry,
+        existing,
+        management,
+        nowMs,
+      );
+      if (cooldownMigrated) save(db, storagePath);
+      return {
+        recorded: false,
+        duplicate: true,
+        cooldown_migrated: cooldownMigrated,
+        pool_address: poolAddress,
+        deploy: existing,
+      };
+    }
+  }
+  // Adaptive mode may have written a provisional close record before wallet
+  // cleanup established the authoritative settlement. Upgrade that same trade
+  // in place instead of counting one position twice in pool quality history.
+  const provisionalIndex = settlementId && deployData.position
+    ? entry.deploys.findIndex((item) => (
+        item.position === deployData.position && item.authoritative_settlement !== true
+      ))
+    : -1;
+  const provisional = provisionalIndex >= 0 ? entry.deploys[provisionalIndex] : null;
 
   const deploy = {
+    settlement_id: settlementId,
+    settlement_source: deployData.settlement_source || null,
+    authoritative_settlement: deployData.authoritative_settlement === true,
     position: deployData.position || null,
     deployed_at: deployData.deployed_at || null,
-    closed_at: deployData.closed_at || new Date().toISOString(),
+    closed_at: deployData.closed_at || new Date(nowMs).toISOString(),
     pnl_pct: deployData.pnl_pct ?? null,
     pnl_usd: deployData.pnl_usd ?? null,
     pnl_sol: deployData.pnl_sol ?? deployData.position_sol_pnl ?? null,
@@ -252,39 +405,75 @@ export function recordPoolDeploy(poolAddress, deployData) {
     exit_tvl: deployData.exit_tvl ?? null,
     exit_volume: deployData.exit_volume ?? null,
   };
+  if (provisional) {
+    for (const [key, value] of Object.entries(provisional)) {
+      if (deploy[key] == null && value != null) deploy[key] = value;
+    }
+  }
 
-  entry.deploys.push(deploy);
+  if (provisionalIndex >= 0) entry.deploys.splice(provisionalIndex, 1, deploy);
+  else entry.deploys.push(deploy);
   entry.total_deploys = entry.deploys.length;
   entry.last_deployed_at = deploy.closed_at;
   recomputeAggregates(entry);
 
-  if (deployData.base_mint && !entry.base_mint) {
-    entry.base_mint = deployData.base_mint;
-  }
+  const authoritativeNetPct = deploy.authoritative_settlement
+    ? Number(deploy.position_sol_pnl_pct ?? deploy.pnl_pct)
+    : null;
+  const smallLossFloorPct = Math.min(0, Number(management.settlementSmallLossFloorPct ?? -0.75));
+  const isSmallSettledStop = Number.isFinite(authoritativeNetPct) &&
+    authoritativeNetPct < 0 &&
+    authoritativeNetPct >= smallLossFloorPct &&
+    isStopLossCloseReason(deploy.close_reason);
+  const isNonLossSettledOutcome = Number.isFinite(authoritativeNetPct) && authoritativeNetPct >= 0;
+  const deferBadOutcomeCooldownToSettlement = config.ledger?.enabled === true &&
+    Boolean(deploy.position) &&
+    deploy.authoritative_settlement !== true;
 
-  if (config.management.badOutcomeCooldownEnabled) {
-    const scope = config.management.badOutcomeCooldownScope;
+  if (management.badOutcomeCooldownEnabled && !deferBadOutcomeCooldownToSettlement) {
+    const scope = management.badOutcomeCooldownScope;
     if (isLowYieldCloseReason(deploy.close_reason)) {
       setScopedCooldown(
         db,
         entry,
-        config.management.lowYieldCooldownHours,
+        management.lowYieldCooldownHours,
         "bad outcome: low yield",
         scope,
+        nowMs,
       );
+    } else if (isNonLossSettledOutcome) {
+      // The close trigger is diagnostic; authoritative settlement decides
+      // whether the outcome deserves a loss cooldown.
+    } else if (isSmallSettledStop) {
+      const cooldownMinutes = Math.max(0, Number(management.settlementSmallLossCooldownMinutes ?? 60));
+      const smallLossScope = cooldownScope(management.settlementSmallLossCooldownScope, "pool");
+      setScopedCooldown(
+        db,
+        entry,
+        cooldownMinutes / 60,
+        `small authoritative stop ${authoritativeNetPct.toFixed(3)}%`,
+        smallLossScope,
+        nowMs,
+      );
+      deploy.cooldown = {
+        scope: smallLossScope,
+        minutes: cooldownMinutes,
+        reason: "small authoritative settled loss",
+      };
     } else if (isStopLossCloseReason(deploy.close_reason)) {
       setScopedCooldown(
         db,
         entry,
-        config.management.stopLossCooldownHours,
+        management.stopLossCooldownHours,
         "bad outcome: stop loss",
         scope,
+        nowMs,
       );
     }
   }
 
-  const oorTriggerCount = config.management.oorCooldownTriggerCount ?? 3;
-  const oorCooldownHours = config.management.oorCooldownHours ?? 12;
+  const oorTriggerCount = management.oorCooldownTriggerCount ?? 3;
+  const oorCooldownHours = management.oorCooldownHours ?? 12;
   const recentDeploys = entry.deploys.slice(-oorTriggerCount);
   const repeatedOorCloses =
     recentDeploys.length >= oorTriggerCount &&
@@ -292,32 +481,32 @@ export function recordPoolDeploy(poolAddress, deployData) {
 
   if (repeatedOorCloses) {
     const reason = `repeated OOR closes (${oorTriggerCount}x)`;
-    const poolCooldownUntil = setPoolCooldown(entry, oorCooldownHours, reason);
-    const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, oorCooldownHours, reason);
+    const poolCooldownUntil = setPoolCooldown(entry, oorCooldownHours, reason, nowMs);
+    const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, oorCooldownHours, reason, nowMs);
     log("pool-memory", `Cooldown set for ${entry.name} until ${poolCooldownUntil} (${reason})`);
     if (entry.base_mint && mintCooldownUntil) {
       log("pool-memory", `Base mint cooldown set for ${entry.base_mint.slice(0, 8)} until ${mintCooldownUntil} (${reason})`);
     }
   }
 
-  if (config.management.repeatDeployCooldownEnabled) {
-    const triggerCount = Math.max(1, Number(config.management.repeatDeployCooldownTriggerCount ?? 3));
-    const cooldownHours = Math.max(0, Number(config.management.repeatDeployCooldownHours ?? 12));
-    const scope = cooldownScope(config.management.repeatDeployCooldownScope, "token");
+  if (management.repeatDeployCooldownEnabled) {
+    const triggerCount = Math.max(1, Number(management.repeatDeployCooldownTriggerCount ?? 3));
+    const cooldownHours = Math.max(0, Number(management.repeatDeployCooldownHours ?? 12));
+    const scope = cooldownScope(management.repeatDeployCooldownScope, "token");
     const recentRepeatDeploys = entry.deploys.slice(-triggerCount);
     const repeatedFeeGeneratingDeploys =
       cooldownHours > 0 &&
       recentRepeatDeploys.length >= triggerCount &&
-      recentRepeatDeploys.every((d) => d.pnl_pct != null && isFeeGeneratingDeploy(d));
+      recentRepeatDeploys.every((d) => d.pnl_pct != null && isFeeGeneratingDeploy(d, management));
 
     if (repeatedFeeGeneratingDeploys) {
       const reason = `repeat fee-generating deploys (${triggerCount}x)`;
       if (scope === "pool" || scope === "both" || !entry.base_mint) {
-        const poolCooldownUntil = setPoolCooldown(entry, cooldownHours, reason);
+        const poolCooldownUntil = setPoolCooldown(entry, cooldownHours, reason, nowMs);
         log("pool-memory", `Cooldown set for ${entry.name} until ${poolCooldownUntil} (${reason})`);
       }
       if ((scope === "token" || scope === "both") && entry.base_mint) {
-        const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, cooldownHours, reason);
+        const mintCooldownUntil = setBaseMintCooldown(db, entry.base_mint, cooldownHours, reason, nowMs);
         if (mintCooldownUntil) {
           log("pool-memory", `Base mint cooldown set for ${entry.base_mint.slice(0, 8)} until ${mintCooldownUntil} (${reason})`);
         }
@@ -325,8 +514,98 @@ export function recordPoolDeploy(poolAddress, deployData) {
     }
   }
 
-  save(db);
+  if (deploy.authoritative_settlement) {
+    const netPct = authoritativeNetPct;
+    const catastrophicStopPct = Number(management.catastrophicStopPct);
+    const breakerSingleLossPct = Number(policy.breakerSingleLossPct ?? config.circuitBreaker.singleLossPct);
+    const catastrophic = Number.isFinite(netPct) && (
+      (Number.isFinite(catastrophicStopPct) && netPct <= catastrophicStopPct) ||
+      (Number.isFinite(breakerSingleLossPct) && netPct < breakerSingleLossPct)
+    );
+    if (catastrophic) {
+      const quarantineHours = Math.max(0, Number(
+        management.catastrophicQuarantineHours ?? management.shadowRotationCatastrophicQuarantineHours ?? 168,
+      ));
+      const reason = `authoritative catastrophic settlement ${netPct.toFixed(2)}%: temporary execution-risk quarantine`;
+      setScopedCooldown(db, entry, quarantineHours, reason, "both", nowMs);
+      deploy.quarantine = {
+        scope: "both",
+        hours: quarantineHours,
+        reason,
+      };
+    }
+  }
+
+  reconcileAuthoritativeSettlementCooldown(db, entry, deploy, management, nowMs);
+
+  save(db, storagePath);
   log("pool-memory", `Recorded deploy for ${entry.name} (${poolAddress.slice(0, 8)}): PnL ${deploy.pnl_pct}%`);
+  return { recorded: true, duplicate: false, pool_address: poolAddress, deploy };
+}
+
+function signedLamports(value, field) {
+  const text = String(value ?? "");
+  if (!/^-?\d+$/.test(text)) throw new TypeError(`${field} must be an integer lamport string`);
+  return BigInt(text);
+}
+
+/**
+ * Persist operational safety memory from the authoritative trade-ledger
+ * settlement. This path is intentionally independent from adaptive learning,
+ * which remains frozen during canary operation.
+ */
+export function recordSettledPoolOutcome({
+  position,
+  lifecycleId,
+  settlementId,
+  poolAddress,
+  poolName = null,
+  baseMint = null,
+  strategy = null,
+  closeReason = null,
+  deployedAt = null,
+  settledAt = null,
+  basisLamports,
+  walletEquityNetLamports,
+} = {}, options = {}) {
+  if (!position || !lifecycleId || !settlementId || !poolAddress) {
+    throw new TypeError("Authoritative settlement outcome requires position, lifecycle, settlement, and pool identities");
+  }
+  const basis = signedLamports(basisLamports, "basisLamports");
+  const net = signedLamports(walletEquityNetLamports, "walletEquityNetLamports");
+  if (basis <= 0n) throw new RangeError("Authoritative settlement basis must be greater than zero");
+  const deployedSol = Number(basis) / 1e9;
+  const pnlSol = Number(net) / 1e9;
+  const pnlPct = Math.round((Number(net) / Number(basis) * 100) * 1e8) / 1e8;
+  const settledAtMs = Date.parse(settledAt);
+  // A crash-safe startup replay may project a settlement hours or days after
+  // it occurred. Anchor operational cooldowns to the authoritative settlement
+  // time so replay cannot silently extend an expired quarantine from "now".
+  const projectionOptions = Object.hasOwn(options, "nowMs")
+    ? options
+    : {
+        ...options,
+        nowMs: Number.isFinite(settledAtMs) ? settledAtMs : Date.now(),
+      };
+  return recordPoolDeploy(poolAddress, {
+    position,
+    pool_name: poolName,
+    base_mint: baseMint,
+    deployed_at: deployedAt,
+    closed_at: settledAt,
+    pnl_pct: pnlPct,
+    pnl_sol: pnlSol,
+    position_sol_deployed: deployedSol,
+    position_sol_final: Math.max(0, deployedSol + pnlSol),
+    position_sol_pnl: pnlSol,
+    position_sol_pnl_pct: pnlPct,
+    wallet_sol_roundtrip_delta_after_autoswap: pnlSol,
+    close_reason: closeReason,
+    strategy,
+    settlement_id: `${lifecycleId}:${settlementId}`,
+    settlement_source: "trade_ledger_wallet_equity_net",
+    authoritative_settlement: true,
+  }, projectionOptions);
 }
 
 export function updatePoolDeploySolMetrics(poolAddress, position, metrics = {}) {

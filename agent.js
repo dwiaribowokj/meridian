@@ -575,7 +575,8 @@ import { getMyPositions } from "./tools/dlmm.js";
 import { log } from "./logger.js";
 import { config } from "./config.js";
 import { getStateSummary } from "./state.js";
-import { getLessonsForPrompt, getPerformanceSummary } from "./lessons.js";
+import { getLessonsForPrompt } from "./lessons.js";
+import { getSettlementPerformanceSummary } from "./settlement-report.js";
 import { getDecisionSummary } from "./decision-log.js";
 
 // Supports OpenRouter (default) or any OpenAI-compatible local server (e.g. LM Studio)
@@ -688,7 +689,27 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
     [portfolio, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
     stateSummary = getStateSummary();
     lessons = getLessonsForPrompt({ agentType: effectiveAgentType });
-    perfSummary = getPerformanceSummary();
+    try {
+      const settlementSummary = getSettlementPerformanceSummary();
+      perfSummary = {
+        source: settlementSummary.source,
+        authoritative: settlementSummary.authoritative,
+        unit: settlementSummary.unit,
+        total_positions_settled: settlementSummary.total_positions_settled,
+        total_pnl_sol: settlementSummary.total_pnl_sol,
+        total_pnl_pct: settlementSummary.total_pnl_pct,
+        win_rate_pct: settlementSummary.win_rate_pct,
+        settlement_pending_count: settlementSummary.settlement_pending_count,
+        excluded_non_cash_count: settlementSummary.excluded_non_cash_count,
+      };
+    } catch (error) {
+      perfSummary = {
+        source: "trade_ledger_wallet_equity_net",
+        authoritative: false,
+        unavailable: true,
+        error: error.message,
+      };
+    }
     decisionSummary = getDecisionSummary();
     weightsSummary = null;
     if (effectiveAgentType === "SCREENER") {

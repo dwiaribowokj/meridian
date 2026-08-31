@@ -15,7 +15,7 @@ import { getMyPositions, getActiveBin, searchPools } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, getPoolDetail, getPoolFeeWindow, degenScore, isNonCanonicalPvpRisk } from "./tools/screening.js";
 import { config, enforceEffectiveRolloutEnvironment, getPaperDeploymentGate, isEffectiveDryRun, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
-import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
+import { evolveThresholds, getPerformanceSummary as getLearningPerformanceSummary } from "./lessons.js";
 import {
   executeTool,
   executeConfirmedCleanup,
@@ -45,16 +45,25 @@ import {
   createLiveMessage,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
+import {
+  getSettlementPerformanceHistory,
+  getSettlementPerformanceSummary,
+} from "./settlement-report.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, getOpenPaperPositions, getShadowRolloutEvidenceSnapshot, setPositionInstruction, updatePnlAndCheckExits, confirmPeak, registerExitSignal } from "./state.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote, setManualTokenCooldown } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
-import { clearCandidateObservation, observeCandidateStability } from "./candidate-observations.js";
+import {
+  clearCandidateObservation,
+  getCandidateAdmissionRecovery,
+  observeCandidateStability,
+} from "./candidate-observations.js";
 import {
   calculateAdaptiveSizing,
   candidatePolicyFromScreening,
+  resolveShadowRotationRange,
   resolveEffectiveTakeProfitPct,
   selectDeterministicCandidate,
   SHADOW_ROTATION_STRATEGY_PROFILE,
@@ -75,6 +84,7 @@ import { getTradeLedger } from "./ledger-runtime.js";
 import {
   listPendingCleanupLifecycles,
   previewPendingCleanupEquity,
+  projectSettledLifecycleOutcomes,
 } from "./cleanup-runtime.js";
 import { attemptAutomaticCircuitBreakerResume } from "./automatic-breaker-resume.js";
 
@@ -98,6 +108,26 @@ if (isMain) {
   }
   log("startup", `Effective mode: ${isEffectiveDryRun() ? "DRY RUN" : "LIVE CANARY"}`);
   log("startup", `Model: ${process.env.LLM_MODEL || "hermes-3-405b"}`);
+  if (!isEffectiveDryRun()) {
+    try {
+      const projection = projectSettledLifecycleOutcomes();
+      if (projection.recorded > 0) {
+        log("startup", `Projected ${projection.recorded} authoritative settlement(s) into operational pool memory`);
+      }
+      if (!projection.success) {
+        log(
+          "startup_warn",
+          `Could not project ${projection.failures.length}/${projection.attempted} authoritative settlement(s): ` +
+            projection.failures.map((failure) => `${failure.lifecycle_id || failure.position || "unknown"}: ${failure.error}`).join("; "),
+        );
+      }
+    } catch (error) {
+      // Projection is a derived operational index. The authoritative ledger is
+      // still intact, so report the degraded memory view without killing the
+      // autonomous runtime during startup.
+      log("startup_warn", `Settlement memory startup projection failed: ${error.message}`);
+    }
+  }
   if (isHiveMindEnabled()) {
     ensureAgentId();
     bootstrapHiveMind().catch((error) => log("hivemind_warn", `Bootstrap failed: ${error.message}`));
@@ -978,7 +1008,7 @@ export async function runManagementCycle({ silent = false, dependencies = {} } =
         ? `SL: ${Number(effectiveSl).toFixed(2)}% (${dynActive ? `DynSL active; peak ${Number(peak).toFixed(2)}%` : `DynSL armed @ +${Number(dynTrigger).toFixed(2)}% → +${Number(dynStop).toFixed(2)}%`})`
         : `SL: ${baseStop ?? "?"}%`;
       const netPct = p.projected_net_pnl_pct ?? p.pnl_pct;
-      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | Net PnL: ${netPct ?? "?"}% | Gross: ${p.pnl_pct ?? "?"}% | Peak: ${Number(peak).toFixed(2)}% | ${slInfo} | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
+      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | Est. Net PnL: ${netPct ?? "?"}% | Gross estimate: ${p.pnl_pct ?? "?"}% | Peak: ${Number(peak).toFixed(2)}% | ${slInfo} | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
       if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
       if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
@@ -1251,6 +1281,14 @@ export async function runScreeningCycle({ silent = false } = {}) {
         filteredOut.push({ name: pool.name, reason: stability.reason });
         continue;
       }
+      const admissionRecovery = getCandidateAdmissionRecovery(pool.pool, config.screening);
+      candidate.admissionRecovery = admissionRecovery;
+      if (admissionRecovery.required && !admissionRecovery.pass) {
+        const reason = `Candidate admission recovery remains blocked for ${Math.ceil(admissionRecovery.remainingMs / 1000)}s after ${admissionRecovery.code}.`;
+        log("screening", `Admission recovery: held ${pool.name} — ${reason}`);
+        filteredOut.push({ name: pool.name, reason });
+        continue;
+      }
       passing.push(candidate);
     }
 
@@ -1362,8 +1400,20 @@ export async function runScreeningCycle({ silent = false } = {}) {
       fundingModel: rotationProfileActive ? config.shadowRotation.fundingModel : "single_side_sol",
       entryEconomics: selection.selected.evaluation.economics,
     };
+    const rotationRange = rotationProfileActive
+      ? resolveShadowRotationRange(volatility, config.shadowRotation)
+      : null;
+    if (rotationProfileActive && !rotationRange?.eligible) {
+      screenReport = `⛔ NO DEPLOY\n\nRotation range selection failed: ${rotationRange?.reason || "invalid volatility/range configuration"}`;
+      return screenReport;
+    }
+    if (rotationRange) {
+      policySnapshot.rangeRegime = rotationRange.regime;
+      policySnapshot.rangeBinsBelow = rotationRange.binsBelow;
+      policySnapshot.rangeBinsAbove = rotationRange.binsAbove;
+    }
     const binsBelow = rotationProfileActive
-      ? config.shadowRotation.binsBelow
+      ? rotationRange.binsBelow
       : Math.max(
           config.strategy.minBinsBelow,
           Math.min(
@@ -1374,8 +1424,8 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const deployStrategy = rotationProfileActive
       ? config.shadowRotation.strategy
       : config.strategy.strategy;
-    const binsAbove = rotationProfileActive ? config.shadowRotation.binsAbove : 0;
-    await liveMessage?.note(`Deterministic winner ${selectedPool.name}; AI approved. Executing fixed ${deployAmount} SOL / ${binsBelow}+${binsAbove} bins.`).catch(() => {});
+    const binsAbove = rotationProfileActive ? rotationRange.binsAbove : 0;
+    await liveMessage?.note(`Deterministic winner ${selectedPool.name}; AI approved. Executing fixed ${deployAmount} SOL / ${binsBelow}+${binsAbove} bins${rotationRange ? ` (${rotationRange.regime})` : ""}.`).catch(() => {});
     // The deterministic selector has already fixed every deploy field. Bind
     // that exact immutable request to a fresh, local one-use capability rather
     // than asking a prompt or provider to authorize (or shape) the deploy.
@@ -2160,15 +2210,29 @@ function formatExtraSearchStatus(symbols = getExtraSearchSymbols()) {
 
 function formatCloseSolLines(result) {
   const fmt = (value) => {
+    if (value == null) return null;
     const n = Number(value);
     return Number.isFinite(n) ? n.toFixed(6) : null;
   };
   const lines = [];
+  const settled = result.settlement_pnl_source === "trade_ledger_wallet_equity_net";
+  lines.push(settled
+    ? "PnL source: on-chain cash settlement"
+    : "PnL source: executable estimate; final settlement pending");
   const pnlSolValue = result.position_sol_pnl ?? result.pnl_sol;
   const pnlSol = fmt(pnlSolValue);
   if (pnlSol != null) {
     const sign = Number(pnlSolValue) >= 0 ? "+" : "";
-    lines.push(`SOL PnL: ${sign}◎${pnlSol}`);
+    const pctValue = result.position_sol_pnl_pct ?? result.pnl_pct;
+    const pct = Number(pctValue);
+    lines.push(`${settled ? "On-chain net PnL" : "Estimated net PnL"}: ${sign}◎${pnlSol}${pctValue != null && Number.isFinite(pct) ? ` (${sign}${pct.toFixed(2)}%)` : ""}`);
+  } else {
+    const pnlValue = Number(result.pnl_usd);
+    const pnlPct = Number(result.pnl_pct);
+    const sign = pnlValue >= 0 ? "+" : "";
+    const unit = config.management.solMode ? "◎" : "$";
+    const digits = config.management.solMode ? 6 : 2;
+    lines.push(`Estimated PnL: ${Number.isFinite(pnlValue) ? `${sign}${unit}${pnlValue.toFixed(digits)}` : "n/a"}${result.pnl_pct != null && Number.isFinite(pnlPct) ? ` (${sign}${pnlPct.toFixed(2)}%)` : ""}`);
   }
   const deployed = fmt(result.position_sol_deployed);
   const finalSol = fmt(result.position_sol_final);
@@ -2176,14 +2240,53 @@ function formatCloseSolLines(result) {
     lines.push(`Position SOL: ◎${deployed} -> ◎${finalSol}`);
   }
   const before = fmt(result.wallet_sol_before_deploy);
-  const after = fmt(result.wallet_sol_after_close);
-  const deltaValue = result.wallet_sol_roundtrip_delta;
+  const walletAfterValue = result.wallet_sol_after_cleanup ?? result.wallet_sol_after_close;
+  const after = fmt(walletAfterValue);
+  const deltaValue = result.wallet_sol_roundtrip_delta_after_cleanup ?? result.wallet_sol_roundtrip_delta;
   const delta = fmt(deltaValue);
   if (before != null && after != null) {
     const sign = Number(deltaValue) >= 0 ? "+" : "";
     lines.push(`Wallet SOL: ◎${before} -> ◎${after}${delta != null ? ` (${sign}◎${delta})` : ""}`);
   }
   return lines;
+}
+
+function formatSettlementPerformanceMessage(report) {
+  const fixed = (value, digits = 6) => {
+    if (value == null) return "n/a";
+    const number = Number(value);
+    return Number.isFinite(number) ? number.toFixed(digits) : "n/a";
+  };
+  const signed = (value) => {
+    if (value == null) return "n/a";
+    const number = Number(value);
+    if (!Number.isFinite(number)) return "n/a";
+    return `${number >= 0 ? "+" : "-"}◎${Math.abs(number).toFixed(6)}`;
+  };
+  const signedPct = (value) => {
+    if (value == null) return "n/a";
+    const number = Number(value);
+    if (!Number.isFinite(number)) return "n/a";
+    return `${number >= 0 ? "+" : ""}${number.toFixed(2)}%`;
+  };
+  const positions = report.positions.map((position, index) => (
+    `${index + 1}. ${position.pool_name} | ${signed(position.pnl_sol)} (${signedPct(position.pnl_pct)}) | ` +
+    `◎${fixed(position.principal_sol)} → ◎${fixed(position.final_sol)} | ${position.minutes_held}m`
+  ));
+  return [
+    `Kinerja final on-chain (${report.hours == null ? "all time" : `${report.hours} jam`})`,
+    "Sumber: arus wallet lifecycle ter-rekonsiliasi; tanpa fallback web-LP",
+    "",
+    `Settlement tunai: ${report.total_positions_settled} | Win rate: ${report.win_rate_pct == null ? "N/A" : `${report.win_rate_pct.toFixed(2)}%`}`,
+    `Net PnL: ${signed(report.total_pnl_sol)} (${signedPct(report.total_pnl_pct)})`,
+    `Modal → Akhir: ◎${fixed(report.total_principal_sol)} → ◎${fixed(report.total_final_sol)}`,
+    `Arus Wallet: keluar ◎${fixed(report.total_wallet_deploy_outflow_sol)} | kembali ◎${fixed(report.total_wallet_post_deploy_inflow_sol)}`,
+    `Biaya transaksi: ◎${fixed(report.total_tx_fee_sol)}`,
+    report.settlement_pending_count > 0 ? `Settlement tertunda: ${report.settlement_pending_count}` : null,
+    report.excluded_non_cash_count > 0 ? `Settlement non-tunai dikecualikan: ${report.excluded_non_cash_count}` : null,
+    positions.length ? "\nSettlement terbaru:" : null,
+    ...positions,
+  ].filter(Boolean).join("\n");
 }
 
 async function updateExtraSearchSymbols(symbols, reason) {
@@ -2538,6 +2641,7 @@ function formatHelpText() {
     "/deploy <n> — deploy candidate by cached index",
     "/deploy <token_address> — find best pool for token and deploy",
     "/briefing — morning briefing",
+    "/performance [hours|all] — reconciled on-chain cash-settled PnL",
     "/hive — HiveMind sync status",
     "/hive pull — manual HiveMind pull now",
     "/pause — stop cron cycles",
@@ -2841,6 +2945,21 @@ async function handleTelegramMessage(msg) {
     return;
   }
 
+  const performanceMatch = text.match(/^\/performance(?:\s+(all|\d+(?:\.\d+)?))?$/i);
+  if (performanceMatch) {
+    try {
+      const requested = performanceMatch[1];
+      const hours = requested?.toLowerCase() === "all"
+        ? null
+        : Math.min(8_760, Math.max(1, requested == null ? 24 : Number(requested)));
+      const report = getSettlementPerformanceHistory({ hours, limit: 10 });
+      await sendMessage(formatSettlementPerformanceMessage(report));
+    } catch (e) {
+      await sendMessage(`On-chain settlement report unavailable: ${e.message}\nNo web-LP fallback was used.`).catch(() => {});
+    }
+    return;
+  }
+
   if (text === "/help") {
     await sendMessage(formatHelpText()).catch(() => {});
     return;
@@ -2886,9 +3005,9 @@ async function handleTelegramMessage(msg) {
         const pnl = p.pnl_usd >= 0 ? `+${cur}${p.pnl_usd}` : `-${cur}${Math.abs(p.pnl_usd)}`;
         const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
         const oor = !p.in_range ? " ⚠️OOR" : "";
-        return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
+        return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | Est. PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
       });
-      await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /set <n> <note> to set instruction`);
+      await sendMessage(`📊 Open Positions (${total_positions})\nPnL source: executable estimate\n\n${lines.join("\n")}\n\n/close <n> to close | /set <n> <note> to set instruction`);
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
     return;
   }
@@ -2905,7 +3024,8 @@ async function handleTelegramMessage(msg) {
         `Pool: ${pos.pool}`,
         `Position: ${pos.position}`,
         `Range: ${pos.lower_bin} → ${pos.upper_bin} | active ${pos.active_bin}`,
-        `PnL: ${pos.pnl_pct ?? "?"}% | fees: ${config.management.solMode ? "◎" : "$"}${pos.unclaimed_fees_usd ?? "?"}`,
+        `Estimated PnL: ${pos.pnl_pct ?? "?"}% | fees: ${config.management.solMode ? "◎" : "$"}${pos.unclaimed_fees_usd ?? "?"}`,
+        `PnL source: executable estimate`,
         `Value: ${config.management.solMode ? "◎" : "$"}${pos.total_value_usd ?? "?"}`,
         `Age: ${pos.age_minutes ?? "?"}m | ${pos.in_range ? "IN RANGE" : `OOR ${pos.minutes_out_of_range ?? 0}m`}`,
         pos.instruction ? `Note: ${pos.instruction}` : null,
@@ -3103,7 +3223,6 @@ async function handleTelegramMessage(msg) {
         await sendMessage([
           `✅ Closed ${pos.pair}`,
           `Reason: ${result.close_reason || "manual /closecooldown"}`,
-          `PnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"}${result.pnl_pct != null ? ` (${result.pnl_pct}%)` : ""}`,
           ...formatCloseSolLines(result),
           `Token cooldown until: ${cooldown.cooldown_until || "n/a"}`,
           `Close txs: ${closeTxs?.join(", ") || "n/a"}`,
@@ -3193,7 +3312,6 @@ async function handleTelegramMessage(msg) {
         await sendMessage([
           `✅ Closed ${pos.pair}`,
           `Reason: ${result.close_reason || "manual /close"}`,
-          `PnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"}${result.pnl_pct != null ? ` (${result.pnl_pct}%)` : ""}`,
           ...solLines,
           `Close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`,
         ].join("\n"));
@@ -3559,6 +3677,7 @@ Commands:
   /status        Refresh wallet + positions
   /candidates    Refresh top pool list
   /briefing      Show morning briefing (last 24h)
+  /performance   Show reconciled on-chain cash-settled PnL
   /learn         Study top LPers from the best current pool and save lessons
   /learn <addr>  Study top LPers from a specific pool address
   /thresholds    Show current screening thresholds + performance stats
@@ -3632,6 +3751,19 @@ Commands:
       return;
     }
 
+    const performanceInput = input.match(/^\/performance(?:\s+(all|\d+(?:\.\d+)?))?$/i);
+    if (performanceInput) {
+      await runBusy(async () => {
+        const requested = performanceInput[1];
+        const hours = requested?.toLowerCase() === "all"
+          ? null
+          : Math.min(8_760, Math.max(1, requested == null ? 24 : Number(requested)));
+        const report = getSettlementPerformanceHistory({ hours, limit: 10 });
+        console.log(`\n${formatSettlementPerformanceMessage(report)}\n`);
+      });
+      return;
+    }
+
     if (input === "/candidates") {
       await runBusy(async () => {
         const { candidates, total_eligible, total_screened } = await getTopCandidates({ limit: 5 });
@@ -3656,10 +3788,10 @@ Commands:
       console.log(`  maxBotHoldersPct:     ${s.maxBotHoldersPct}`);
       console.log(`  maxTop10Pct:          ${s.maxTop10Pct}`);
       console.log(`  timeframe:            ${s.timeframe}`);
-      const perf = getPerformanceSummary();
-      if (perf) {
-        console.log(`\n  Based on ${perf.total_positions_closed} closed positions`);
-        console.log(`  Win rate: ${perf.win_rate_pct}%  |  Avg PnL: ${perf.avg_pnl_pct}%`);
+      const perf = getSettlementPerformanceSummary();
+      if (perf.total_positions_settled > 0) {
+        console.log(`\n  Based on ${perf.total_positions_settled} on-chain cash settlements`);
+        console.log(`  Win rate: ${perf.win_rate_pct.toFixed(2)}%  |  Net PnL: ${perf.total_pnl_sol >= 0 ? "+" : ""}${perf.total_pnl_sol.toFixed(6)} SOL (${perf.total_pnl_pct.toFixed(2)}%)`);
       } else {
         console.log("\n  No closed positions yet — thresholds are preset defaults.");
       }
@@ -3719,7 +3851,7 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
 
     if (input === "/evolve") {
       await runBusy(async () => {
-        const perf = getPerformanceSummary();
+        const perf = getLearningPerformanceSummary();
         if (!perf || perf.total_positions_closed < 5) {
           const needed = 5 - (perf?.total_positions_closed || 0);
           console.log(`\nNeed at least 5 closed positions to evolve. ${needed} more needed.\n`);

@@ -165,6 +165,45 @@ function sanitizePaperPolicySnapshot(snapshot) {
     }
     clean.entryEconomics.eligible = entryEconomics.eligible === true;
   }
+  const entryExecutableLiquidity = snapshot.entryExecutableLiquidity;
+  if (entryExecutableLiquidity && typeof entryExecutableLiquidity === "object" && !Array.isArray(entryExecutableLiquidity)) {
+    const executable = {};
+    for (const key of [
+      "quotedAtMs",
+      "quoteSlippageBps",
+      "recoveryBps",
+      "roundTripLossBps",
+      "maxPriceImpactBps",
+      "maxRoundTripLossBps",
+      "deployAmountSol",
+    ]) {
+      const value = optionalPaperNumber(entryExecutableLiquidity[key]);
+      if (value != null) executable[key] = value;
+    }
+    for (const key of [
+      "source",
+      "baseMint",
+      "inputSolLamports",
+      "modeledTokenRaw",
+      "executableRecoveryLamports",
+    ]) {
+      const value = sanitizeStoredText(entryExecutableLiquidity[key], 160);
+      if (value) executable[key] = value;
+    }
+    for (const side of ["buy", "sell"]) {
+      const quote = entryExecutableLiquidity[side];
+      if (!quote || typeof quote !== "object" || Array.isArray(quote)) continue;
+      executable[side] = {
+        routeFound: quote.routeFound === true,
+        worstOutRaw: sanitizeStoredText(quote.worstOutRaw, 160),
+        networkFeeLamports: sanitizeStoredText(quote.networkFeeLamports, 160),
+        worstNetLamports: sanitizeStoredText(quote.worstNetLamports, 160),
+        priceImpactBps: optionalPaperNumber(quote.priceImpactBps),
+        error: sanitizeStoredText(quote.error, 280),
+      };
+    }
+    if (Object.keys(executable).length > 0) clean.entryExecutableLiquidity = executable;
+  }
   if (Array.isArray(snapshot.observations)) {
     clean.observations = snapshot.observations.slice(-4).map((observation) => ({
       observedAtMs: optionalPaperNumber(observation?.observedAtMs),

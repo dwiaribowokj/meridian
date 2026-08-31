@@ -1146,47 +1146,81 @@ export async function quoteTokenSwap({
   output_mint = "SOL",
   amount_raw,
   use_referral = false,
+  slippage_bps = 50,
 }) {
   input_mint = normalizeMint(input_mint);
   output_mint = normalizeMint(output_mint);
   const raw = String(amount_raw ?? "");
   if (!/^\d+$/.test(raw) || BigInt(raw) <= 0n) throw new Error("amount_raw must be a positive integer string");
-  const wallet = getWallet();
   const search = new URLSearchParams({
     inputMint: input_mint,
     outputMint: output_mint,
     amount: raw,
-    taker: wallet.publicKey.toString(),
+    slippageBps: String(Math.max(1, Math.min(500, Math.round(Number(slippage_bps) || 50)))),
   });
   const referralParams = use_referral ? getJupiterReferralParams() : null;
   if (referralParams) {
-    search.set("referralAccount", referralParams.referralAccount);
-    search.set("referralFee", String(referralParams.referralFee));
+    search.set("platformFeeBps", String(referralParams.referralFee));
   }
   const apiKey = getJupiterApiKey();
-  const response = await fetch(`${JUPITER_SWAP_V2_API}/order?${search}`, {
+  // `/order` validates the taker's current token balance. It therefore cannot
+  // quote the modeled sell leg of pre-deploy admission: that inventory does
+  // not exist until after the buy. The balance-independent quote endpoint is
+  // the correct depth/valuation primitive; actual cleanup execution still
+  // rebuilds and audits a source-account-bound `/order` before signing.
+  const response = await fetch(`${JUPITER_SWAP_V2_API}/quote?${search}`, {
     headers: apiKey ? { "x-api-key": apiKey } : {},
     signal: AbortSignal.timeout(READ_ONLY_HTTP_TIMEOUT_MS),
   });
   if (!response.ok) {
-    return { routeFound: false, error: `Jupiter order ${response.status}: ${await response.text()}` };
+    return { routeFound: false, error: `Jupiter quote ${response.status}: ${await response.text()}` };
   }
-  const order = await response.json();
-  if (order.errorCode || order.errorMessage || !order.transaction) {
-    return { routeFound: false, error: order.errorMessage || order.errorCode || "No executable route" };
+  const quote = await response.json();
+  if (quote.errorCode || quote.errorMessage || quote.error || !quote.outAmount) {
+    return { routeFound: false, error: quote.errorMessage || quote.errorCode || quote.error || "No executable route" };
   }
-  const worstOutLamports = String(order.outAmount ?? order.outputAmount ?? order.otherAmountThreshold ?? "0");
-  const signatureFeeLamports = BigInt(String(order.signatureFeeLamports ?? 5_000));
-  const prioritizationFeeLamports = BigInt(String(order.prioritizationFeeLamports ?? 0));
-  const rentFeeLamports = BigInt(String(order.rentFeeLamports ?? 0));
+  return buildExecutableSwapQuote(quote, {
+    inputMint: input_mint,
+    outputMint: output_mint,
+    amountRaw: raw,
+    fallbackNetworkFeeLamports: config.cleanup?.maxNetworkFeeLamports ?? 100_000,
+  });
+}
+
+export function buildExecutableSwapQuote(order, {
+  inputMint,
+  outputMint,
+  amountRaw,
+  quotedAtMs = Date.now(),
+  fallbackNetworkFeeLamports = 5_000,
+} = {}) {
+  const expectedOutRaw = String(order?.outAmount ?? order?.outputAmount ?? "0");
+  // Prefer Jupiter's slippage-protected threshold when it is present. Calling
+  // an expected output "worst" previously overstated both cleanup recovery and
+  // live PnL during fast moves.
+  const worstOutLamports = String(order?.otherAmountThreshold ?? expectedOutRaw);
+  const signatureFeeLamports = BigInt(String(order?.signatureFeeLamports ?? fallbackNetworkFeeLamports));
+  const prioritizationFeeLamports = BigInt(String(order?.prioritizationFeeLamports ?? 0));
+  const rentFeeLamports = BigInt(String(order?.rentFeeLamports ?? 0));
   const networkFeeLamports = signatureFeeLamports + prioritizationFeeLamports + rentFeeLamports;
-  const impact = Number(order.priceImpactPct ?? 0);
+  const impact = Number(order?.priceImpactPct);
+  const outputIsNativeSol = outputMint === SOL_MINT || outputMint === HELIUS_NATIVE_SOL_MINT;
+  const worstOutput = BigInt(worstOutLamports);
   return {
-    routeFound: BigInt(worstOutLamports) > 0n,
+    routeFound: worstOutput > 0n,
+    inputMint,
+    outputMint,
+    amountRaw: String(amountRaw),
+    expectedOutRaw,
     worstOutLamports,
     networkFeeLamports: networkFeeLamports.toString(),
-    priceImpactBps: String(Math.max(0, Math.round(impact * 100))),
-    worstNetLamports: (BigInt(worstOutLamports) > networkFeeLamports ? BigInt(worstOutLamports) - networkFeeLamports : 0n).toString(),
+    priceImpactBps: Number.isFinite(impact) ? String(Math.max(0, Math.round(impact * 100))) : null,
+    // Network fees are lamports and can only be subtracted from a native-SOL
+    // output. For SOL->token inventory modeling, preserve raw token units.
+    worstNetLamports: (outputIsNativeSol
+      ? (worstOutput > networkFeeLamports ? worstOutput - networkFeeLamports : 0n)
+      : worstOutput).toString(),
+    quotedAtMs,
     rawOrder: order,
   };
 }

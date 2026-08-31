@@ -26,6 +26,8 @@ import {
   deriveCleanupTerminalEconomics,
   executeEconomicCleanup,
   listPendingCleanupLifecycles,
+  persistSettledLifecycleOutcome,
+  projectSettledLifecycleOutcomes,
   reconcileLifecycleCleanup,
 } from "../cleanup-runtime.js";
 import {
@@ -536,6 +538,63 @@ try {
     ["reconciliation_checked", "trade_settled", "profit_exit"],
     "settlement emits reconciliation, trade, and profit-exit breaker events exactly once",
   );
+  let projectedOutcome = null;
+  const projection = persistSettledLifecycleOutcome({
+    finalization: settled,
+    position: "Position111",
+    closeReason: "TRAILING_TP",
+    getPositions: () => [{
+      position: "Position111",
+      pool: "Pool111",
+      pool_name: "TimingToken-SOL",
+      base_mint: "TimingTokenMint",
+      strategy: "spot",
+      deployed_at: "2026-07-22T00:00:00.000Z",
+    }],
+    recordOutcome: (outcome) => {
+      projectedOutcome = outcome;
+      return { recorded: true, outcome };
+    },
+  });
+  assert.equal(projection.recorded, true);
+  assert.deepEqual(projectedOutcome, {
+    position: "Position111",
+    lifecycleId: "lp:Position111",
+    settlementId: "cleanup:position111:empty",
+    poolAddress: "Pool111",
+    poolName: "TimingToken-SOL",
+    baseMint: "TimingTokenMint",
+    strategy: "spot",
+    closeReason: "TRAILING_TP",
+    deployedAt: "2026-07-22T00:00:00.000Z",
+    settledAt: settled.settlement.occurred_at,
+    basisLamports: "100",
+    walletEquityNetLamports: "0",
+  }, "authoritative settlement identity and net lamports feed operational memory");
+
+  const startupProjectionCalls = [];
+  const startupProjection = projectSettledLifecycleOutcomes({
+    store: {
+      listLifecycles: () => [settled.lifecycle, { lifecycle_id: "lp:active", state: "ACTIVE" }],
+    },
+    getPositions: () => [{
+      position: "Position111",
+      pool: "Pool111",
+      pool_name: "TimingToken-SOL",
+      base_mint: "TimingTokenMint",
+      strategy: "spot",
+      deployed_at: "2026-07-22T00:00:00.000Z",
+    }],
+    getReason: () => "TRAILING_TP",
+    recordOutcome: (outcome) => {
+      startupProjectionCalls.push(outcome);
+      return { recorded: true, duplicate: false };
+    },
+  });
+  assert.equal(startupProjection.success, true);
+  assert.equal(startupProjection.attempted, 1, "startup replay only projects authoritative settled lifecycles");
+  assert.equal(startupProjection.recorded, 1);
+  assert.equal(startupProjectionCalls[0].settlementId, "cleanup:position111:empty");
 
   const afterSettlement = ledger.readEvents().length;
   const retried = finalizeLifecycleWithStore({

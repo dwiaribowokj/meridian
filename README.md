@@ -266,6 +266,8 @@ REPL commands:
 | `/learn` | Study top LPers across all current candidate pools |
 | `/learn <pool_address>` | Study top LPers for a specific pool |
 | `/thresholds` | Current screening thresholds and performance stats |
+| `/briefing` | Last-24-hour on-chain cash-settled report |
+| `/performance [hours\|all]` | Reconciled on-chain settlement history |
 | `/evolve` | Trigger threshold evolution from performance data (needs 5+ closed positions) |
 | `/stop` | Graceful shutdown |
 | `<anything>` | Free-form chat — ask the agent anything, request actions, analyze pools |
@@ -455,6 +457,25 @@ PENDING_DEPLOY → BASIS_PENDING → ACTIVE → CLOSING → CLEANUP_PENDING → 
 - `SETTLED` requires zero economic residue and reconciled wallet/component
   equity within the configured lamport tolerance. Settlement PnL, rather than
   the pre-close API estimate, is the authoritative result.
+- Morning briefing, `meridian performance`, Telegram `/performance`, and the
+  `get_performance_history` tool read only these cash-settled ledger results.
+  They sum lifecycle-bound deploy, close, swap, cleanup, rent, and transaction
+  fee flows; unrelated wallet transfers and Meteora/web-LP PnL are excluded.
+- Open positions remain executable estimates and are labeled as estimates.
+  If the ledger is unavailable, final PnL reporting fails explicitly instead
+  of falling back to a web/API value.
+- Every settled net result is projected idempotently into pool memory. A normal
+  stop loss receives the configured temporary cooldown; only an authoritative
+  loss beyond the catastrophic/single-loss boundary quarantines both pool and
+  mint for seven days. This is execution-risk memory, not a permanent token
+  blacklist. The settlement amount remains the authoritative PnL; the normal
+  cooldown records that a stop condition was triggered.
+
+While a position is open, token inventory is valued from a fresh executable
+Jupiter token-to-SOL quote using its slippage-protected output after SOL fees.
+Spot USD marks remain diagnostics only. If positive token inventory has no
+fresh executable route, actionable PnL is unavailable and PnL-derived SL/TP
+signals pause for that tick; independently observed OOR state remains active.
 
 The global live-canary deploy guard serializes the RPC position check and the
 entire deploy outcome, preventing two concurrent requests from both observing
@@ -587,6 +608,7 @@ Meridian sends notifications automatically for:
 | `/canaryguard` | Inspect the global live-canary deploy guard |
 | `/canaryguard reconcile <operation_id> …` | Reconcile and release a retained guard after fresh authoritative evidence |
 | `/screen`, `/candidates`, `/deploy <n>` | Refresh candidates, inspect the cache, or request a deterministic candidate deploy |
+| `/briefing`, `/performance [hours\|all]` | Reconciled on-chain cash-settled PnL; no web-LP fallback |
 | `/pause`, `/resume` | Stop or restart cron cycles without changing the durable breaker |
 | `/set <n> <note>` | Set a note or instruction on a position |
 
@@ -629,7 +651,11 @@ show the effective runtime view.
 | `minTokenFeesSol` | `30` | `80` | Minimum global fees paid in SOL |
 | `maxBotHoldersPct` | `30` | `25` | Maximum bot-holder percentage |
 | `maxTop10Pct` | `60` | `30` | Maximum top-10 holder concentration |
-| Candidate confirmation | `2`, at least `2m` apart | `3`, at least `30s` apart | Fee/volume retention and, in rotation, price/bin stability |
+| Candidate confirmation | `2`, at least `2m` apart | configurable, currently `2` at least `30s` apart | Fee/volume retention and, in rotation, price/bin stability plus a 5m dwell after instability |
+| Failed admission recovery | n/a | `5m`, then `2` quotes `25s` apart | Applies only after volatility or executable-liquidity failure; ordinary candidates still use one quote |
+| Admission quote slippage | n/a | `25 bps` per leg | Models realistic executable depth without requiring pre-owned token inventory |
+| Executable entry impact | n/a | at most `1%` per leg | Fresh Jupiter `SOL → token → SOL` quote required before deploy |
+| Executable round-trip loss | n/a | at most `1.25%`, clamped to the stop budget | Reject thin routes whose executable recovery already consumes excessive downside |
 | Token age | unbounded | `1h–72h` | Minimum and maximum token age |
 | `minBinStep` / `maxBinStep` | `80` / `125` | same | Allowed DLMM bin step |
 | `blockedLaunchpads` | `[]` | same | Launchpad names to reject |
@@ -644,10 +670,10 @@ show the effective runtime view.
 | `deployAmountSol` | `0.5` | `0.20` | SOL requested per new position |
 | `maxPositions` | `3` | `1` | Maximum simultaneous positions |
 | `strategy` | `bid_ask` | `spot` | DLMM liquidity strategy |
-| Range | minimum `35` bins below | `5 below + 0 above` | Locked rotation uses single-side SOL funding |
+| Range | minimum `35` bins below | `<3.5`: `4+1`; `3.5–<4.5`: `6+2` | Volatility selects the configured single-side SOL range; `>=4.5` is skipped |
 | `outOfRangeWaitMinutes` | `30` | `5` above-range exit | Time before an OOR exit is eligible |
-| `stopLossPct` | `-50` | `-1` | Projected equity-net stop loss |
-| `catastrophicStopPct` | `-2.5` | `-1.5` | Immediate catastrophic boundary |
+| `stopLossPct` | `-50` | `-1.25` | Projected equity-net stop loss |
+| `catastrophicStopPct` | `-2.5` | `-2.5` | Immediate catastrophic boundary |
 | `takeProfitPct` | `5` | `0.5` | Projected equity-net take profit |
 | `takeProfitExecutionBufferPct` | `0` | `0.75` | Additive projected-close reserve; rotation TP gate is therefore `1.25%` |
 | `estimatedRoundTripCostPct` | `1.0` | `0.4` | Cost assumption used by admission/exit modeling |
@@ -655,9 +681,9 @@ show the effective runtime view.
 | `minNetProfitSol` | `0.0005` | `0.00005` | Minimum modeled net-profit SOL |
 | `maxHoldMinutes` | `360` | `90` | Maximum bounded hold time |
 
-The base yield-hold entry policy requires 5m RSI at least `40` and 15m RSI at least `35`; the rotation defaults are `35` and `40`, respectively. Both reject overextended RSI (`75`/`80`). Fee admission uses the same conservative assumptions as paper valuation: 50% fee haircut, 25% participation, modeled round-trip cost, and at most a six-hour coverage horizon. A shadow stop-loss blocks the pool and base token for the remainder of that evidence epoch.
+The base yield-hold entry policy requires 5m RSI at least `40` and 15m RSI at least `35`; the rotation defaults are `35` on both intervals. Both reject overextended RSI (`75`/`80`). Fee admission uses the same conservative assumptions as paper valuation: 50% fee haircut, 25% participation, modeled round-trip cost, and at most a six-hour coverage horizon. A shadow stop-loss blocks the pool and base token for the remainder of that evidence epoch.
 
-The locked rotation profile is a micro/trending-pool rollout shared by shadow and the only authorized live canary. It uses one sequential `0.20 SOL` position, a live-compatible single-side SOL `5 below + 0 above` spot range, 5m/15m trend continuation, three stability observations at least 30 seconds apart, and a position-notional cap of 2% of active TVL. Rotation candidates default to a 72-hour maximum token age, 1.0% minimum 30m fee/active-TVL, volatility below 7.5, 15m RSI of at least 40, and 5m RSI below 75. Stability includes fee, volume, and price: a peak-to-current drawdown of 1.5% or a consecutive downside move of two DLMM bins resets confirmation. When a qualified token has same-symbol rival mints, deterministic score ranking retains one canonical eligible pool rather than dropping the whole symbol. Open paper positions are observed by a read-only 15-second monitor; a catastrophic stop quarantines the pool and mint for seven days, while the run-level cooldown prevents repeat use in the same evidence epoch. Discovery still enforces mint/freeze authority, concentration, SOL-quote, blocklist, and bounded bot-holder audits. Evidence is labeled `rotation_live_v1` and every lifecycle must use exactly `0.20 SOL`; older `rotation_v1` balanced-proxy evidence cannot authorize this canary. Normally, live remains fail-closed until the historical, 24-hour heartbeat, five-settled-lifecycle, strictly positive net, profit factor of at least `1.2`, maximum single loss of at most `2.5%`, drawdown, reconciliation, cleanup, breaker, and exact-exposure gates all pass. An exact operator override can bypass source-readiness gates, but all transaction, exposure, lifecycle, cleanup, guard, and breaker boundaries remain enforced.
+The locked rotation profile is a micro/trending-pool rollout shared by shadow and the only authorized live canary. It uses one sequential `0.20 SOL` spot position and selects its range from 30m volatility: `4 below + 1 above` below `3.5`, `6 below + 2 above` from `3.5` to below `4.5`, and no deploy at `4.5` or higher. Momentum remains advisory under the current soft indicator configuration. Stability includes fee, volume, and price; a reset cannot be erased by quick samples because entry remains blocked for five minutes. A volatility or executable-quote failure uses the same five-minute recovery dwell and must then pass two executable quotes 25 seconds apart. Candidates without a prior admission failure still need only one quote. Final admission models the entire `0.20 SOL` amount into the token and back to SOL. Only catastrophic settled loss quarantines pool and mint for seven days; a small authoritative stop loss from `-0.75%` to below zero receives a one-hour pool-only cooldown. Discovery still enforces authority, concentration, SOL quote, blocklist, holder, and economic gates. Evidence remains labeled `rotation_live_v1`; sizing is fixed at `0.20 SOL` and one live position.
 
 ### Ledger, cleanup, and circuit breaker
 
@@ -668,6 +694,8 @@ The locked rotation profile is a micro/trending-pool rollout shared by shadow an
 | `ledgerReconcileToleranceLamports` | `10000` | Maximum absolute settlement reconciliation error |
 | `cleanupEnabled` | `true` | Enable position-scoped post-close cleanup and retry |
 | `cleanupMaxPriceImpactPct` | `5` | Maximum cleanup swap price impact |
+| `cleanupConfirmationReads` | `2` | Stable RPC reads retained around cleanup execution |
+| `cleanupConfirmationDelayMs` | `500` | Delay between stable reads; lower than the old 2s close-to-swap delay |
 | `circuitBreakerEnabled` | `true` | Enable durable live-entry breaker |
 | `circuitAutomaticResume` | `true` | Automatically recover economic/operational latches after clean zero-exposure proof |
 | `circuitAutomaticResumeCooldownSeconds` | `60` | Minimum clean-state delay before a recoverable latch starts a fresh risk epoch |

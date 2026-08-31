@@ -36,23 +36,39 @@ export const SHADOW_ROTATION_POLICY = deepFreeze({
   minGlobalFeesSol: 80,
   maxBotHolderPct: 25,
   maxTop10Pct: 30,
-  // The 24-hour live canary admits a little more of the observed trending-pool
-  // distribution while the three-snapshot price/bin stability gates remain
-  // authoritative.
-  maxVolatilityExclusive: 7.5,
+  maxVolatilityExclusive: 4.5,
+  mediumVolatilityMin: 3.5,
+  mediumVolatilityBinsBelow: 6,
+  mediumVolatilityBinsAbove: 2,
   confirmationCount: 3,
   confirmationSpacingMs: 30_000,
   confirmationWindowMs: 5 * MINUTE_MS,
+  // A price/bin reset is evidence of a bad entry moment. Three short recovery
+  // samples may rebuild the ordinary confirmation count, but cannot erase the
+  // instability until this dwell has elapsed.
+  instabilityRecoveryDwellMs: 5 * MINUTE_MS,
   minRetentionPct: 60,
   requirePriceStability: true,
   maxPriceDrawdownPct: 1.5,
   maxDownsideBinDelta: 2,
+  // Admission models the entire canary amount as token inventory, then proves
+  // that Jupiter can sell it back to SOL without consuming the stop budget.
+  // Use a realistic execution tolerance for admission. The wider 50 bps quote
+  // remains appropriate for live liquidation valuation, but applying it to
+  // both modeled legs rejects otherwise executable 0.20 SOL routes.
+  entryExecutableQuoteSlippageBps: 25,
+  maxEntryExecutablePriceImpactBps: 100,
+  maxEntryExecutableRoundTripLossPct: 1.25,
+  admissionRecoveryDwellMs: 5 * MINUTE_MS,
+  executableRecoveryConfirmationCount: 2,
+  executableRecoverySpacingMs: 25_000,
+  executableRecoveryMaxSpacingMs: 30_000,
   monitorIntervalSeconds: 15,
   catastrophicQuarantineHours: 168,
   maxEvaluationAgeMs: 2 * MINUTE_MS,
   maxPositionActiveTvlPct: 2,
   minEntryRsi5m: 35,
-  minEntryRsi15m: 40,
+  minEntryRsi15m: 35,
   maxEntryRsi5m: 75,
   maxEntryRsi15m: 80,
   feeParticipationPct: 75,
@@ -65,14 +81,51 @@ export const SHADOW_ROTATION_POLICY = deepFreeze({
   minimumProjectedNetFeePct: 0.10,
   maxHoldMinutes: 90,
   takeProfitPct: 0.50,
-  stopLossPct: -1,
-  catastrophicStopPct: -1.5,
+  stopLossPct: -1.25,
+  catastrophicStopPct: -2.5,
   // Consecutive PnL ticks already provide the noise guard. Delaying the normal
   // stop as well would leave fresh positions protected only by the wider
   // catastrophic threshold during their highest-risk opening minutes.
   normalStopGraceMinutes: 0,
   aboveRangeExitMinutes: 5,
 });
+
+export function resolveShadowRotationRange(volatility, rotation = SHADOW_ROTATION_POLICY) {
+  const value = Number(volatility);
+  const maxVolatilityExclusive = Number(
+    rotation.maxVolatilityExclusive ?? SHADOW_ROTATION_POLICY.maxVolatilityExclusive,
+  );
+  if (!Number.isFinite(value) || value <= 0) {
+    return { eligible: false, reason: "Rotation volatility is missing or invalid." };
+  }
+  if (!Number.isFinite(maxVolatilityExclusive) || value >= maxVolatilityExclusive) {
+    return {
+      eligible: false,
+      reason: `Rotation volatility ${value} is at or above the ${maxVolatilityExclusive} deployment cap.`,
+    };
+  }
+
+  const mediumVolatilityMin = Number(
+    rotation.mediumVolatilityMin ?? SHADOW_ROTATION_POLICY.mediumVolatilityMin,
+  );
+  const medium = Number.isFinite(mediumVolatilityMin) && value >= mediumVolatilityMin;
+  const binsBelow = Math.round(Number(medium
+    ? rotation.mediumVolatilityBinsBelow ?? SHADOW_ROTATION_POLICY.mediumVolatilityBinsBelow
+    : rotation.binsBelow ?? SHADOW_ROTATION_POLICY.binsBelow));
+  const binsAbove = Math.round(Number(medium
+    ? rotation.mediumVolatilityBinsAbove ?? SHADOW_ROTATION_POLICY.mediumVolatilityBinsAbove
+    : rotation.binsAbove ?? SHADOW_ROTATION_POLICY.binsAbove));
+  if (!Number.isInteger(binsBelow) || !Number.isInteger(binsAbove) || binsBelow < 4 || binsAbove < 0) {
+    return { eligible: false, reason: "Rotation range configuration is invalid." };
+  }
+  return {
+    eligible: true,
+    regime: medium ? "medium_volatility" : "low_volatility",
+    volatility: value,
+    binsBelow,
+    binsAbove,
+  };
+}
 
 /**
  * Return the projected-PnL gate used by both live and paper net-exit paths.
@@ -142,21 +195,35 @@ export function isAuthorizedRotationRange({
   strategy = null,
   binsBelow = null,
   binsAbove = null,
+  volatility = null,
   rotationStrategy = SHADOW_ROTATION_POLICY.strategy,
   rotationBinsBelow = SHADOW_ROTATION_POLICY.binsBelow,
   rotationBinsAbove = SHADOW_ROTATION_POLICY.binsAbove,
+  rotationMediumVolatilityMin = SHADOW_ROTATION_POLICY.mediumVolatilityMin,
+  rotationMediumBinsBelow = SHADOW_ROTATION_POLICY.mediumVolatilityBinsBelow,
+  rotationMediumBinsAbove = SHADOW_ROTATION_POLICY.mediumVolatilityBinsAbove,
+  rotationMaxVolatilityExclusive = SHADOW_ROTATION_POLICY.maxVolatilityExclusive,
 } = {}) {
   const rotationStageAuthorized = effectiveDryRun === true || effectiveRolloutMode === "canary";
   const requestedBelow = Number(binsBelow);
   const requestedAbove = Number(binsAbove);
-  const requiredBelow = Number(rotationBinsBelow);
-  const requiredAbove = Number(rotationBinsAbove);
+  const resolvedRange = resolveShadowRotationRange(volatility, {
+    binsBelow: rotationBinsBelow,
+    binsAbove: rotationBinsAbove,
+    mediumVolatilityMin: rotationMediumVolatilityMin,
+    mediumVolatilityBinsBelow: rotationMediumBinsBelow,
+    mediumVolatilityBinsAbove: rotationMediumBinsAbove,
+    maxVolatilityExclusive: rotationMaxVolatilityExclusive,
+  });
+  const requiredBelow = resolvedRange.binsBelow;
+  const requiredAbove = resolvedRange.binsAbove;
   const minimumRotationBelow = SHADOW_ROTATION_POLICY.binsBelow;
   const minimumRotationTotal = SHADOW_ROTATION_POLICY.binsBelow + SHADOW_ROTATION_POLICY.binsAbove;
   return rotationStageAuthorized === true &&
     rotationEnabled === true &&
     strategyProfile === SHADOW_ROTATION_STRATEGY_PROFILE &&
     String(strategy || "").trim() === String(rotationStrategy || "").trim() &&
+    resolvedRange.eligible === true &&
     Number.isInteger(requestedBelow) &&
     Number.isInteger(requestedAbove) &&
     Number.isInteger(requiredBelow) &&

@@ -8,6 +8,7 @@ import { confirmIndicatorPreset, confirmStrictEntryMomentum } from "./chart-indi
 import { appendCandidateObservations, buildCandidateObservation } from "./rejected-candidate-evidence.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { candidatePolicyFromScreening } from "../risk-policy.js";
+import { recordCandidateAdmissionFailure } from "../candidate-observations.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -248,8 +249,8 @@ export function getRawPoolScreeningRejectReasons(pool, s) {
   }
   if (!isUsableVolatility(volatility)) {
     reasons.push(`volatility ${volatility ?? "unknown"} is unusable`);
-  } else if (s.maxVolatility != null && volatility > s.maxVolatility) {
-    reasons.push(`volatility ${volatility} above maxVolatility ${s.maxVolatility}`);
+  } else if (s.maxVolatility != null && volatility >= s.maxVolatility) {
+    reasons.push(`volatility ${volatility} at or above maxVolatility ${s.maxVolatility}`);
   }
   if (baseOrganic == null || baseOrganic < s.minOrganic) {
     reasons.push(`base organic ${baseOrganic ?? "unknown"} below minOrganic ${s.minOrganic}`);
@@ -834,6 +835,20 @@ export async function discoverPools({
   const filteredExamples = [];
   const thresholdedRawPools = rawPools.filter((pool) => {
     const reasons = getRawPoolScreeningRejectReasons(pool, s);
+    const volatility = numeric(pool?.volatility);
+    if (pool?.pool_address && (
+      !isUsableVolatility(volatility) ||
+      (s.maxVolatility != null && volatility >= Number(s.maxVolatility))
+    )) {
+      const volatilityUsable = isUsableVolatility(volatility);
+      recordCandidateAdmissionFailure(pool.pool_address, {
+        code: "VOLATILITY_OUT_OF_RANGE",
+        reason: volatilityUsable
+          ? `Volatility ${volatility} is at or above the ${s.maxVolatility} deployment cap.`
+          : `Volatility ${volatility ?? "unknown"} is unusable.`,
+        volatility,
+      }, s);
+    }
     candidateObservations.push(buildCandidateObservation(pool, { ts: observationTs, reasons }));
     if (reasons.length === 0) return true;
     const reason = reasons.join("; ");
@@ -993,8 +1008,13 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         return false;
       }
       const volatility = Number(p.volatility);
-      if (Number.isFinite(maxVolatility) && maxVolatility > 0 && volatility > maxVolatility) {
-        pushFilteredReason(filteredOut, p, `volatility ${volatility} above maxVolatility ${maxVolatility}`);
+      if (Number.isFinite(maxVolatility) && maxVolatility > 0 && volatility >= maxVolatility) {
+        recordCandidateAdmissionFailure(p.pool, {
+          code: "VOLATILITY_OUT_OF_RANGE",
+          reason: `Volatility ${volatility} is at or above the ${maxVolatility} deployment cap.`,
+          volatility,
+        }, config.screening);
+        pushFilteredReason(filteredOut, p, `volatility ${volatility} at or above maxVolatility ${maxVolatility}`);
         return false;
       }
       if (occupiedPools.has(p.pool)) {

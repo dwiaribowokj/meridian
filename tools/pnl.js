@@ -7,6 +7,8 @@ import {
   markInRange,
   minutesOutOfRange,
 } from "../state.js";
+import { quoteTokenSwap } from "./wallet.js";
+import { evaluateExecutableTokenQuote } from "../executable-liquidity.js";
 
 // ─── Public-infra PnL engine ───────────────────────────────────
 // Live position value (current liquidity + claimable fees) is read ON-CHAIN
@@ -46,6 +48,18 @@ function maybeNum(value) {
   if (value == null || value === "") return null;
   const n = parseFloat(value);
   return Number.isFinite(n) ? n : null;
+}
+function rawBigInt(value) {
+  if (value == null || value === "") return null;
+  const text = String(value);
+  return /^\d+$/.test(text) ? BigInt(text) : null;
+}
+function rawToHuman(value, decimals) {
+  const raw = rawBigInt(value);
+  const scale = Number(decimals);
+  if (raw == null || !Number.isInteger(scale) || scale < 0 || scale > 255) return null;
+  const human = Number(raw) / 10 ** scale;
+  return Number.isFinite(human) ? human : null;
 }
 function fallbackDepositSol(tracked) {
   const amountSol = Number(tracked?.amount_sol);
@@ -171,6 +185,7 @@ async function getJupiterPrices(mints) {
 // is a slow 24h pool stat. Cache per pool, refetch when any position's latest
 // signature changes or the TTL lapses.
 const _meteoraCache = new Map(); // pool -> { at, byPosition, sigByPosition }
+const _executableQuoteCache = new Map(); // mint:raw -> { quotedAtMs, quote }
 let _pollCount = 0;
 
 async function getLatestSig(conn, addr) {
@@ -216,20 +231,136 @@ function mapEntries(map) {
   return map instanceof Map ? [...map.entries()] : Object.entries(map || {});
 }
 
+export function deriveExecutableInventoryValuation({
+  xRaw,
+  feeXRaw,
+  yRaw,
+  feeYRaw,
+  decY = 9,
+  quote = null,
+  quotedAtMs = null,
+  nowMs = Date.now(),
+  maxQuoteAgeMs = 15_000,
+} = {}) {
+  const tokenPrincipalRaw = rawBigInt(xRaw);
+  const tokenFeeRaw = rawBigInt(feeXRaw);
+  const nativePrincipalSol = rawToHuman(yRaw, decY);
+  const nativeFeeSol = rawToHuman(feeYRaw, decY);
+  if (tokenPrincipalRaw == null || tokenFeeRaw == null || nativePrincipalSol == null || nativeFeeSol == null) {
+    return {
+      pass: false,
+      requiresQuote: true,
+      code: "INVALID_ON_CHAIN_POSITION_AMOUNTS",
+      reason: "On-chain LP token amounts are malformed.",
+    };
+  }
+
+  const totalTokenRaw = tokenPrincipalRaw + tokenFeeRaw;
+  const assessment = evaluateExecutableTokenQuote({
+    tokenRaw: totalTokenRaw.toString(),
+    quote,
+    quotedAtMs,
+    nowMs,
+    maxAgeMs: maxQuoteAgeMs,
+  });
+  if (!assessment.pass) {
+    return {
+      pass: false,
+      requiresQuote: totalTokenRaw > 0n,
+      totalTokenRaw: totalTokenRaw.toString(),
+      nativePrincipalSol,
+      nativeFeeSol,
+      code: assessment.code,
+      reason: assessment.reason,
+    };
+  }
+
+  const totalTokenValueLamports = BigInt(assessment.valueLamports);
+  const tokenPrincipalValueLamports = totalTokenRaw > 0n
+    ? totalTokenValueLamports * tokenPrincipalRaw / totalTokenRaw
+    : 0n;
+  const tokenFeeValueLamports = totalTokenValueLamports - tokenPrincipalValueLamports;
+  const tokenPrincipalSol = Number(tokenPrincipalValueLamports) / 1e9;
+  const tokenFeeSol = Number(tokenFeeValueLamports) / 1e9;
+  const balancesSol = nativePrincipalSol + tokenPrincipalSol;
+  const claimableSol = nativeFeeSol + tokenFeeSol;
+  return {
+    pass: true,
+    requiresQuote: totalTokenRaw > 0n,
+    totalTokenRaw: totalTokenRaw.toString(),
+    tokenPrincipalRaw: tokenPrincipalRaw.toString(),
+    tokenFeeRaw: tokenFeeRaw.toString(),
+    tokenPrincipalValueLamports: tokenPrincipalValueLamports.toString(),
+    tokenFeeValueLamports: tokenFeeValueLamports.toString(),
+    totalTokenValueLamports: totalTokenValueLamports.toString(),
+    tokenPrincipalSol,
+    tokenFeeSol,
+    nativePrincipalSol,
+    nativeFeeSol,
+    balancesSol,
+    claimableSol,
+    totalLiquidationSol: balancesSol + claimableSol,
+    quote: assessment.evidence,
+    quoteCode: assessment.code,
+    source: totalTokenRaw > 0n ? "jupiter_executable_sell_quote" : "native_sol_only",
+  };
+}
+
+async function executableInventoryValuation(f, nowMs = Date.now()) {
+  const xRaw = rawBigInt(f.xRaw);
+  const feeXRaw = rawBigInt(f.feeXRaw);
+  const totalTokenRaw = xRaw != null && feeXRaw != null ? xRaw + feeXRaw : null;
+  const ttlMs = Math.max(1, Number(config.pnl.executableQuoteTtlSec ?? 6)) * 1000;
+  if (totalTokenRaw == null || totalTokenRaw === 0n || !f.baseMint) {
+    return deriveExecutableInventoryValuation({ ...f, nowMs, maxQuoteAgeMs: ttlMs });
+  }
+
+  for (const [key, cached] of _executableQuoteCache) {
+    if (nowMs - cached.quotedAtMs > ttlMs * 4) _executableQuoteCache.delete(key);
+  }
+  const cacheKey = `${f.baseMint}:${totalTokenRaw}`;
+  let cached = _executableQuoteCache.get(cacheKey);
+  if (!cached || nowMs - cached.quotedAtMs > ttlMs) {
+    let quote;
+    try {
+      quote = await quoteTokenSwap({
+        input_mint: f.baseMint,
+        output_mint: config.tokens.SOL,
+        amount_raw: totalTokenRaw.toString(),
+        use_referral: false,
+      });
+    } catch (error) {
+      quote = { routeFound: false, error: error.message };
+    }
+    cached = { quote, quotedAtMs: Date.now() };
+    _executableQuoteCache.set(cacheKey, cached);
+  }
+  return deriveExecutableInventoryValuation({
+    ...f,
+    quote: cached.quote,
+    quotedAtMs: cached.quotedAtMs,
+    nowMs: Date.now(),
+    maxQuoteAgeMs: ttlMs,
+  });
+}
+
 // ─── Build the shaped position object (matches getMyPositions output) ──
-function buildPosition(f, prices, solUsd, meteora, solMode) {
+function buildPosition(f, prices, solUsd, meteora, solMode, executableValuation) {
   const tracked = getTrackedPosition(f.position);
   const priceX = f.baseMint ? (prices[f.baseMint] ?? 0) : 0;
 
   const xHuman = safeNum(f.xRaw) / 10 ** f.decX;
   const yHuman = safeNum(f.yRaw) / 10 ** f.decY;
   const balancesUsd = xHuman * priceX + yHuman * (solUsd ?? 0);
-  const balancesSol = solUsd ? balancesUsd / solUsd : yHuman;
+  const spotBalancesSol = solUsd ? balancesUsd / solUsd : yHuman;
 
   const feeXHuman = safeNum(f.feeXRaw) / 10 ** f.decX;
   const feeYHuman = safeNum(f.feeYRaw) / 10 ** f.decY;
   const claimableUsd = feeXHuman * priceX + feeYHuman * (solUsd ?? 0);
-  const claimableSol = solUsd ? claimableUsd / solUsd : feeYHuman;
+  const spotClaimableSol = solUsd ? claimableUsd / solUsd : feeYHuman;
+  const executableReady = executableValuation?.pass === true;
+  const balancesSol = executableReady ? executableValuation.balancesSol : spotBalancesSol;
+  const claimableSol = executableReady ? executableValuation.claimableSol : spotClaimableSol;
 
   const meteoraDepositsUsd = safeNum(meteora?.allTimeDeposits?.total?.usd);
   const meteoraDepositsSol = safeNum(meteora?.allTimeDeposits?.total?.sol);
@@ -252,8 +383,13 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
   const pnlSol = balancesSol + withdrawSol + claimableSol + claimedSol - depositsSol;
   const pctUsd = depositsUsd > 0 ? (pnlUsd / depositsUsd) * 100 : 0;
   const pctSol = depositsSol > 0 ? (pnlSol / depositsSol) * 100 : 0;
+  const executableBalancesUsd = executableReady && solUsd > 0 ? balancesSol * solUsd : null;
+  const executableClaimableUsd = executableReady && solUsd > 0 ? claimableSol * solUsd : null;
+  const executablePnlUsd = executableReady && solUsd > 0 ? pnlSol * solUsd : null;
 
-  const ourPct = solMode ? pctSol : pctUsd;
+  // Exit decisions are denominated in SOL and must use the amount Jupiter can
+  // actually return, regardless of the display mode selected by the operator.
+  const ourPct = executableReady ? pctSol : null;
 
   const deployOutflowSol = tracked?.wallet_sol_before_deploy != null && tracked?.wallet_sol_after_deploy != null
     ? Math.max(0, Number(tracked.wallet_sol_before_deploy) - Number(tracked.wallet_sol_after_deploy))
@@ -281,16 +417,22 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
   // deposit cache (stale up to depositCacheTtlSec) while ourPct is fresh every
   // poll, so on a fast move the gap inflates and would falsely suppress
   // STOP_LOSS / TRAILING_TP exactly when they matter.
-  const reportedPct = solMode ? maybeNum(meteora?.pnlSolPctChange) : maybeNum(meteora?.pnlPctChange);
-  const pnlPctDiff = reportedPct != null ? Math.abs(ourPct - reportedPct) : null;
+  // The actionable mark above is always SOL-denominated, so its provider
+  // comparison must use Meteora's SOL percentage even when the UI displays
+  // USD. Comparing unlike denominations would create a false outlier veto.
+  const reportedPct = maybeNum(meteora?.pnlSolPctChange);
+  const pnlPctDiff = reportedPct != null && ourPct != null ? Math.abs(ourPct - reportedPct) : null;
 
   // On-chain amounts are authoritative; a tick is "suspicious" (don't act on it)
-  // only when we couldn't price it. Guards against:
-  //  - Jupiter outage → solUsd/priceX missing → balances collapse → false STOP_LOSS
+  // when positive token inventory has no fresh executable sell quote. Spot
+  // prices remain diagnostics and can never authorize a live PnL exit.
+  // Guards against:
+  //  - Jupiter route outage → token value is unknown → false STOP_LOSS
   //  - missing Meteora deposits → 0 cost basis → garbage pnl / inflated value
   const holdsTokenX = xHuman > 0 || feeXHuman > 0;
-  const priceMissing = !(solUsd > 0) || (holdsTokenX && !!f.baseMint && !(priceX > 0));
-  const depositsMissing = (solMode ? depositsSol : depositsUsd) <= 0 || (ledgerTracked && !localBasisReady);
+  const spotPriceMissing = !(solUsd > 0) || (holdsTokenX && !!f.baseMint && !(priceX > 0));
+  const executableQuoteMissing = !executableReady;
+  const depositsMissing = depositsSol <= 0 || (ledgerTracked && !localBasisReady);
   const ageFromState = tracked?.deployed_at
     ? Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000)
     : null;
@@ -307,11 +449,13 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
   // outlier veto for untracked/legacy positions and for every missing-input
   // case, where it still prevents false exits from provider anomalies.
   const actionableOutlierReason = localBasisReady ? null : outlierReason;
-  const pnlPctSuspicious = priceMissing || depositsMissing || !!actionableOutlierReason;
+  const pnlPctSuspicious = executableQuoteMissing || depositsMissing || !!actionableOutlierReason;
   if (pnlPctSuspicious) {
-    log("pnl_warn", `${f.position.slice(0, 8)} suspicious tick — priceMissing=${priceMissing} depositsMissing=${depositsMissing} outlier=${actionableOutlierReason || false} (solUsd=${solUsd}, priceX=${priceX})`);
+    log("pnl_warn", `${f.position.slice(0, 8)} suspicious tick — executableQuoteMissing=${executableQuoteMissing} depositsMissing=${depositsMissing} outlier=${actionableOutlierReason || false} quote=${executableValuation?.code || "unavailable"}`);
   } else if (outlierReason) {
-    log("pnl_warn", `${f.position.slice(0, 8)} ledger-basis tick accepted with diagnostic outlier=${outlierReason} (solUsd=${solUsd}, priceX=${priceX})`);
+    log("pnl_warn", `${f.position.slice(0, 8)} ledger-basis executable tick accepted with diagnostic outlier=${outlierReason}`);
+  } else if (spotPriceMissing) {
+    log("pnl_warn", `${f.position.slice(0, 8)} executable SOL valuation accepted while spot USD diagnostics are unavailable`);
   }
 
   const inRange = f.active != null && f.lower != null && f.upper != null
@@ -330,24 +474,36 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
     upper_bin:          f.upper ?? tracked?.bin_range?.max ?? null,
     active_bin:         f.active ?? tracked?.bin_range?.active ?? null,
     in_range:           inRange,
-    unclaimed_fees_usd: round(solMode ? claimableSol : claimableUsd),
-    unclaimed_fees_sol: round(claimableSol, 9),
-    unclaimed_fees_true_usd: round(claimableUsd),
-    total_value_usd:    round(solMode ? balancesSol : balancesUsd),
-    total_value_true_usd: round(balancesUsd),
+    unclaimed_fees_usd: executableReady ? round(solMode ? claimableSol : executableClaimableUsd) : null,
+    unclaimed_fees_sol: executableReady ? round(claimableSol, 9) : null,
+    unclaimed_fees_true_usd: executableClaimableUsd != null ? round(executableClaimableUsd) : null,
+    total_value_usd:    executableReady ? round(solMode ? balancesSol : executableBalancesUsd) : null,
+    total_value_sol:    executableReady ? round(balancesSol, 9) : null,
+    total_value_true_usd: executableBalancesUsd != null ? round(executableBalancesUsd) : null,
+    spot_total_value_usd: round(balancesUsd),
+    spot_unclaimed_fees_usd: round(claimableUsd),
     collected_fees_usd: round(solMode ? claimedSol : claimedUsd),
     collected_fees_true_usd: round(claimedUsd),
-    pnl_usd:            round(solMode ? pnlSol : pnlUsd),
-    pnl_true_usd:       round(pnlUsd),
-    pnl_pct:            round(ourPct, 2),
-    projected_net_pnl_sol: round(projectedNetPnlSol, 9),
-    projected_net_pnl_pct: projectedNetPnlPct != null ? round(projectedNetPnlPct, 2) : null,
+    pnl_usd:            executableReady ? round(solMode ? pnlSol : executablePnlUsd) : null,
+    pnl_true_usd:       executablePnlUsd != null ? round(executablePnlUsd) : null,
+    spot_pnl_true_usd:  round(pnlUsd),
+    pnl_pct:            ourPct != null ? round(ourPct, 2) : null,
+    pnl_pct_spot:       round(solMode ? (depositsSol > 0 ? ((spotBalancesSol + withdrawSol + spotClaimableSol + claimedSol - depositsSol) / depositsSol) * 100 : 0) : pctUsd, 2),
+    projected_net_pnl_sol: executableReady ? round(projectedNetPnlSol, 9) : null,
+    projected_net_pnl_pct: executableReady && projectedNetPnlPct != null ? round(projectedNetPnlPct, 2) : null,
     projected_exit_cost_sol: round(projectedExitCostSol, 9),
     projected_rent_reclaim_sol: round(projectedRentReclaimSol, 9),
     pnl_basis_valid: !depositsMissing,
-    pnl_pct_derived:    round(ourPct, 2),
+    pnl_pct_derived:    ourPct != null ? round(ourPct, 2) : null,
     pnl_pct_diff:       pnlPctDiff != null ? round(pnlPctDiff, 2) : null,
     pnl_pct_suspicious: !!pnlPctSuspicious,
+    pnl_valuation_source: executableReady ? executableValuation.source : null,
+    pnl_executable_quote_required: executableValuation?.requiresQuote === true,
+    pnl_executable_quote_available: executableReady,
+    pnl_executable_quote_code: executableReady ? executableValuation.quoteCode : executableValuation?.code || null,
+    pnl_executable_quote: executableValuation?.quote || null,
+    executable_token_value_lamports: executableReady ? executableValuation.totalTokenValueLamports : null,
+    executable_token_value_sol: executableReady ? round(Number(executableValuation.totalTokenValueLamports) / 1e9, 9) : null,
     pnl_cost_basis_source: localBasisReady
       ? "local_ledger"
       : legacyStateBasisSol > 0
@@ -405,13 +561,21 @@ export async function computePositions(walletAddress) {
     return { wallet: walletAddress, total_positions: 0, positions: [], source: "rpc" };
   }
 
-  const [prices, meteoraByPosition] = await Promise.all([
+  const [prices, meteoraByPosition, executableValuations] = await Promise.all([
     getJupiterPrices([SOL_MINT, ...flat.map((f) => f.baseMint)]),
     getMeteoraData(conn, walletAddress, flat),
+    Promise.all(flat.map((f) => executableInventoryValuation(f))),
   ]);
   const solUsd = prices[SOL_MINT] ?? null;
 
-  const positions = flat.map((f) => buildPosition(f, prices, solUsd, meteoraByPosition[f.position], solMode));
+  const positions = flat.map((f, index) => buildPosition(
+    f,
+    prices,
+    solUsd,
+    meteoraByPosition[f.position],
+    solMode,
+    executableValuations[index],
+  ));
 
   return { wallet: walletAddress, total_positions: positions.length, positions, source: "rpc" };
 }

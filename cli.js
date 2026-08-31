@@ -200,9 +200,9 @@ Output: { count, blacklist: [{mint, symbol, reason, added_at}] }
 \`\`\`
 
 ### meridian performance [--limit 200]
-Shows all closed position performance history with summary stats.
+Shows reconciled on-chain cash settlement history with summary stats.
 \`\`\`
-Output: { summary: { total_positions_closed, total_pnl_usd, avg_pnl_pct, win_rate_pct, total_lessons }, count, positions: [...] }
+Output: { summary: { total_positions_settled, total_pnl_sol, total_pnl_pct, win_rate_pct }, count, positions: [...] }
 \`\`\`
 
 ### meridian discord-signals [clear]
@@ -599,11 +599,16 @@ switch (subcommand) {
 
   // ── performance ──────────────────────────────────────────────────
   case "performance": {
-    const { getPerformanceHistory, getPerformanceSummary } = await import("./lessons.js");
+    const { getSettlementPerformanceHistory } = await import("./settlement-report.js");
     const limit = flags.limit ? parseInt(flags.limit) : 200;
-    const history = getPerformanceHistory({ hours: 999999, limit });
-    const summary = getPerformanceSummary();
-    out({ summary, ...history });
+    const history = getSettlementPerformanceHistory({ hours: null, limit });
+    const { positions, returned_count, count, ...summary } = history;
+    out({
+      summary,
+      count,
+      returned_count,
+      positions,
+    });
     break;
   }
 

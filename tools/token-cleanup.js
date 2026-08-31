@@ -890,17 +890,16 @@ export async function executeTokenCleanup(plan, dependencies = {}, {
   const policy = makeCleanupPolicy({ ...plan.policy, ...policyOverrides });
   const failures = [];
   const swaps = [];
-  const batchActions = actionable.filter((action) => action.action !== "swap_then_close");
+  let batchActions = actionable.filter((action) => action.action !== "swap_then_close");
 
-  for (const action of actionable) {
+  // Swap sources are checked immediately before build and again before submit.
+  // Avoid an earlier identical stable read that only delays post-close conversion.
+  for (const action of batchActions) {
     const before = await readStableAccount(action, deps, policy);
     if (!before.exists) {
       failures.push({ action, stage: "preflight", error: "token account no longer exists" });
-      const index = batchActions.indexOf(action);
-      if (index >= 0) batchActions.splice(index, 1);
       continue;
     }
-    const plannedRaw = BigInt(action.rawAmount);
     const expectedAccountRaw = BigInt(action.provenance?.currentRawAmount ?? action.rawAmount);
     const validRaw = action.action === "close"
       ? before.rawAmount === 0n
@@ -911,22 +910,14 @@ export async function executeTokenCleanup(plan, dependencies = {}, {
         stage: "preflight",
         error: `raw balance changed from ${expectedAccountRaw} to ${before.rawAmount}`,
       });
-      const index = batchActions.indexOf(action);
-      if (index >= 0) batchActions.splice(index, 1);
       continue;
     }
-    if (action.action === "swap_then_close") {
-      try {
-        exactSwapSource(action, before, swapWalletPublicKey);
-        assertEconomicSwapPolicy(action, policy);
-      } catch (error) {
-        failures.push({ action, stage: "preflight", error: error.message });
-      }
-    }
   }
+  batchActions = batchActions.filter((action) => !failures.some((failure) => failure.action === action));
 
   for (const action of swapActions) {
     if (failures.some((failure) => failure.action === action)) continue;
+    let failureStage = "preflight";
     try {
       // A prior preflight is only advisory. Re-read the exact account just
       // before invoking the adapter so no intervening balance/owner/mint/program
@@ -934,6 +925,7 @@ export async function executeTokenCleanup(plan, dependencies = {}, {
       const sourceImmediatelyBeforeBuild = await readStableAccount(action, deps, policy);
       exactSwapSource(action, sourceImmediatelyBeforeBuild, swapWalletPublicKey);
       const quote = assertEconomicSwapPolicy(action, policy);
+      failureStage = "swap";
       const preparation = await deps.prepareSwap(action);
       if (!successful(preparation)) {
         const error = new Error(preparation?.error || "swap preparation failed");
@@ -987,7 +979,7 @@ export async function executeTokenCleanup(plan, dependencies = {}, {
     } catch (error) {
       failures.push({
         action,
-        stage: "swap",
+        stage: failureStage,
         error: error.message,
         ...(error?.blocked ? { blocked: error.blocked } : {}),
       });

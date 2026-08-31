@@ -47,6 +47,7 @@ import {
   executeTokenCleanup,
   planTokenCleanup,
 } from "./tools/token-cleanup.js";
+import { recordSettledPoolOutcome } from "./pool-memory.js";
 import { log } from "./logger.js";
 
 let connection = null;
@@ -121,6 +122,8 @@ function cleanupPolicy() {
     maxBurnClosePerBatch: config.cleanup.maxBurnClosePerBatch,
     maxCloseOnlyPerBatch: config.cleanup.maxCloseOnlyPerBatch,
     maxSerializedBytes: config.cleanup.maxSerializedBytes,
+    confirmationReads: config.cleanup.confirmationReads,
+    confirmationDelayMs: config.cleanup.confirmationDelayMs,
   };
 }
 
@@ -1069,6 +1072,113 @@ async function recordSettlementBreakerEvents(finalization, reason) {
 }
 
 /**
+ * Project one authoritative SETTLED ledger result into operational pool
+ * memory. The ledger remains the accounting source of truth; this projection
+ * only controls future admission cooldown/quarantine and is settlement-id
+ * idempotent so a cleanup retry cannot add a second outcome.
+ */
+export function persistSettledLifecycleOutcome({
+  finalization,
+  position = null,
+  closeReason = null,
+  getPositions = getTrackedPositions,
+  recordOutcome = recordSettledPoolOutcome,
+} = {}) {
+  const lifecycle = finalization?.lifecycle;
+  const settlement = finalization?.settlement || lifecycle?.settlement;
+  if (lifecycle?.state !== "SETTLED" || !settlement) {
+    return { recorded: false, skipped: true, reason: "LIFECYCLE_NOT_SETTLED" };
+  }
+
+  const canonicalPosition = String(lifecycle.position_address || position || "").trim();
+  const settlementId = settlement.metadata?.reconciliation_id || settlement.event_id;
+  const trackedRows = getPositions(false);
+  if (!Array.isArray(trackedRows)) {
+    throw new TypeError("Tracked position registry is unavailable for settlement memory projection");
+  }
+  const tracked = trackedRows.find((item) => String(item?.position || "") === canonicalPosition) || null;
+  const metadata = lifecycle.metadata && typeof lifecycle.metadata === "object"
+    ? lifecycle.metadata
+    : {};
+
+  return recordOutcome({
+    position: canonicalPosition,
+    lifecycleId: lifecycle.lifecycle_id,
+    settlementId,
+    poolAddress: lifecycle.pool_address || tracked?.pool,
+    poolName: metadata.pool_name || tracked?.pool_name || null,
+    baseMint: metadata.base_mint || tracked?.base_mint || tracked?.signal_snapshot?.base_mint || null,
+    strategy: metadata.strategy || tracked?.strategy || null,
+    closeReason,
+    deployedAt: metadata.deployed_at || tracked?.deployed_at || lifecycle.created_at || null,
+    settledAt: settlement.occurred_at || null,
+    basisLamports: lifecycle.cost_basis?.usable_basis_lamports,
+    walletEquityNetLamports: settlement.wallet_equity_net_lamports ?? lifecycle.wallet_equity_net_lamports,
+  });
+}
+
+/**
+ * Replay every authoritative settlement into operational pool memory. The
+ * projection itself is settlement-idempotent, so this is safe at startup and
+ * closes the crash window between durable ledger settlement and pool-memory
+ * persistence.
+ */
+export function projectSettledLifecycleOutcomes({
+  store = getTradeLedger(),
+  getPositions = getTrackedPositions,
+  getReason = getCloseLifecycleReason,
+  recordOutcome = recordSettledPoolOutcome,
+} = {}) {
+  const lifecycles = store.listLifecycles();
+  if (!Array.isArray(lifecycles)) {
+    throw new TypeError("Trade ledger lifecycle listing is unavailable for settlement memory projection");
+  }
+  const trackedRows = getPositions(false);
+  if (!Array.isArray(trackedRows)) {
+    throw new TypeError("Tracked position registry is unavailable for settlement memory projection");
+  }
+
+  const results = [];
+  for (const lifecycle of lifecycles) {
+    if (lifecycle?.state !== "SETTLED" || !lifecycle.settlement) continue;
+    const position = String(lifecycle.position_address || "").trim();
+    try {
+      const outcome = persistSettledLifecycleOutcome({
+        finalization: { lifecycle, settlement: lifecycle.settlement },
+        position,
+        closeReason: getReason(position, { store }),
+        getPositions: () => trackedRows,
+        recordOutcome,
+      });
+      results.push({
+        lifecycle_id: lifecycle.lifecycle_id,
+        position,
+        recorded: outcome?.recorded === true,
+        duplicate: outcome?.duplicate === true,
+      });
+    } catch (error) {
+      results.push({
+        lifecycle_id: lifecycle.lifecycle_id || null,
+        position: position || null,
+        recorded: false,
+        duplicate: false,
+        error: error.message,
+      });
+    }
+  }
+
+  const failures = results.filter((result) => result.error);
+  return {
+    success: failures.length === 0,
+    attempted: results.length,
+    recorded: results.filter((result) => result.recorded).length,
+    duplicates: results.filter((result) => result.duplicate).length,
+    failures,
+    results,
+  };
+}
+
+/**
  * Per-position cleanup + reconciliation entry point. `execute: false` is
  * preview-only; `execute: true` additionally requires the executor's private
  * capability and is used by the operator boundary or confirmed-close hook.
@@ -1301,7 +1411,19 @@ export async function reconcileLifecycleCleanup({
     if (finalization?.blocked === "COST_BASIS_NOT_READY") {
       await recordBreakerSafely({ type: "basis_invalid", atMs: Date.now() });
     }
-    await recordSettlementBreakerEvents(finalization, getCloseLifecycleReason(position));
+    const closeReason = (dependencies?.getCloseLifecycleReason || getCloseLifecycleReason)(position, {
+      store: dependencies?.store || getTradeLedger(),
+    });
+    const settlementMemory = finalization?.lifecycle?.state === "SETTLED"
+      ? persistSettledLifecycleOutcome({
+        finalization,
+        position,
+        closeReason,
+        getPositions: dependencies?.getTrackedPositions || getTrackedPositions,
+        recordOutcome: dependencies?.recordSettledPoolOutcome || recordSettledPoolOutcome,
+      })
+      : null;
+    await recordSettlementBreakerEvents(finalization, closeReason);
     const settled = finalization?.lifecycle?.state === "SETTLED";
     const finalizationBlocked = finalization?.blocked || (settled ? null : "RECONCILIATION_REQUIRED");
     await recordBreakerSafely({
@@ -1337,6 +1459,7 @@ export async function reconcileLifecycleCleanup({
       execution,
       reconciliation,
       finalization,
+      settlementMemory,
     };
   } catch (error) {
     await recordBreakerSafely({ type: "operation_failure", operation: "cleanup", atMs: Date.now() });

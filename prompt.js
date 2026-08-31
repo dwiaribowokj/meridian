@@ -66,7 +66,8 @@ Role: ${effectiveAgentType}
 Portfolio: ${JSON.stringify(portfolio, null, 2)}
 Open Positions: ${JSON.stringify(positions, null, 2)}
 Memory: ${JSON.stringify(stateSummary, null, 2)}
-Performance: ${perfSummary ? JSON.stringify(perfSummary, null, 2) : "No closed positions yet"}
+Closed Performance (on-chain cash settlements only): ${perfSummary ? JSON.stringify(perfSummary, null, 2) : "No closed positions yet"}
+Open-position PnL fields are executable estimates and must never be described as settled results.
 
 Config: ${JSON.stringify({
   screening: config.screening,

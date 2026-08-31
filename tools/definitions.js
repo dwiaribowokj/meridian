@@ -963,9 +963,12 @@ Call list_lessons first to find the lesson ID.`,
     type: "function",
     function: {
       name: "get_performance_history",
-      description: `Retrieve closed position records filtered by time window.
+      description: `Retrieve authoritative closed-position settlements filtered by time window.
 Use when the user asks about recent performance, last 24h positions, how you've been doing, P&L history, etc.
-Returns individual closed positions with PnL, fees, strategy, hold time, and close reason.`,
+Returns SOL principal, final SOL, net SOL PnL, deploy wallet outflow, post-deploy wallet inflow,
+transaction fees, strategy, hold time, and close reason. Values come only from reconciled on-chain
+lifecycle transactions. Meteora/web-LP PnL, unrelated wallet transfers, open-position estimates,
+and settlements that still contain residual token/rent value are excluded.`,
       parameters: {
         type: "object",
         properties: {
@@ -975,7 +978,7 @@ Returns individual closed positions with PnL, fees, strategy, hold time, and clo
           },
           limit: {
             type: "number",
-            description: "Max records to return (default 50)"
+            description: "Max records to return (default 20)"
           }
         }
       }

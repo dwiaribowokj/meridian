@@ -78,6 +78,16 @@ if (u.agentMeridianApiUrl) process.env.AGENT_MERIDIAN_API_URL ||= u.agentMeridia
 if (u.telegramChatId) process.env.TELEGRAM_CHAT_ID ||= String(u.telegramChatId);
 
 const indicatorUserConfig = u.chartIndicators ?? {};
+const indicatorCacheTtl5mSec = Math.min(300, nonNegativeFiniteConfig(indicatorUserConfig.cacheTtl5mSec, 60));
+const indicatorCacheTtl15mSec = Math.min(600, nonNegativeFiniteConfig(indicatorUserConfig.cacheTtl15mSec, 120));
+const indicatorStaleIfError5mSec = Math.max(
+  indicatorCacheTtl5mSec,
+  Math.min(600, nonNegativeFiniteConfig(indicatorUserConfig.staleIfError5mSec, 90)),
+);
+const indicatorStaleIfError15mSec = Math.max(
+  indicatorCacheTtl15mSec,
+  Math.min(900, nonNegativeFiniteConfig(indicatorUserConfig.staleIfError15mSec, 180)),
+);
 
 // Optional standalone GMGN config file (mirrors user-config layering)
 const GMGN_CONFIG_PATH = repoPath("gmgn-config.json");
@@ -370,6 +380,24 @@ const shadowRotationConfig = deepFreeze({
     0,
     15,
   )),
+  mediumVolatilityMin: boundedShadowRotationNumber(
+    u.shadowRotationMediumVolatilityMin,
+    SHADOW_ROTATION_POLICY.mediumVolatilityMin,
+    1,
+    4.4,
+  ),
+  mediumVolatilityBinsBelow: Math.round(boundedShadowRotationNumber(
+    u.shadowRotationMediumVolatilityBinsBelow,
+    SHADOW_ROTATION_POLICY.mediumVolatilityBinsBelow,
+    4,
+    MIN_SAFE_BINS_BELOW,
+  )),
+  mediumVolatilityBinsAbove: Math.round(boundedShadowRotationNumber(
+    u.shadowRotationMediumVolatilityBinsAbove,
+    SHADOW_ROTATION_POLICY.mediumVolatilityBinsAbove,
+    0,
+    15,
+  )),
   minPoolTvlUsd: boundedShadowRotationNumber(
     u.shadowRotationMinTvl,
     SHADOW_ROTATION_POLICY.minPoolTvlUsd,
@@ -478,6 +506,12 @@ const shadowRotationConfig = deepFreeze({
     2,
     15,
   ) * 60_000),
+  instabilityRecoveryDwellMs: Math.round(boundedShadowRotationNumber(
+    u.shadowRotationInstabilityRecoveryMinutes,
+    SHADOW_ROTATION_POLICY.instabilityRecoveryDwellMs / 60_000,
+    2,
+    15,
+  ) * 60_000),
   minRetentionPct: boundedShadowRotationNumber(
     u.shadowRotationMinRetentionPct,
     SHADOW_ROTATION_POLICY.minRetentionPct,
@@ -496,6 +530,48 @@ const shadowRotationConfig = deepFreeze({
     1,
     5,
   ),
+  entryExecutableQuoteSlippageBps: Math.round(boundedShadowRotationNumber(
+    u.shadowRotationExecutableQuoteSlippageBps,
+    SHADOW_ROTATION_POLICY.entryExecutableQuoteSlippageBps,
+    10,
+    50,
+  )),
+  maxEntryExecutablePriceImpactBps: Math.round(boundedShadowRotationNumber(
+    u.shadowRotationMaxExecutablePriceImpactPct,
+    SHADOW_ROTATION_POLICY.maxEntryExecutablePriceImpactBps / 100,
+    0.25,
+    2.5,
+  ) * 100),
+  maxEntryExecutableRoundTripLossPct: boundedShadowRotationNumber(
+    u.shadowRotationMaxExecutableRoundTripLossPct,
+    SHADOW_ROTATION_POLICY.maxEntryExecutableRoundTripLossPct,
+    0.5,
+    2.5,
+  ),
+  admissionRecoveryDwellMs: Math.round(boundedShadowRotationNumber(
+    u.shadowRotationAdmissionRecoveryMinutes,
+    SHADOW_ROTATION_POLICY.admissionRecoveryDwellMs / 60_000,
+    1,
+    15,
+  ) * 60_000),
+  executableRecoveryConfirmationCount: Math.round(boundedShadowRotationNumber(
+    u.shadowRotationExecutableRecoveryConfirmationCount,
+    SHADOW_ROTATION_POLICY.executableRecoveryConfirmationCount,
+    2,
+    3,
+  )),
+  executableRecoverySpacingMs: Math.round(boundedShadowRotationNumber(
+    u.shadowRotationExecutableRecoverySpacingSeconds,
+    SHADOW_ROTATION_POLICY.executableRecoverySpacingMs / 1000,
+    20,
+    30,
+  ) * 1000),
+  executableRecoveryMaxSpacingMs: Math.round(boundedShadowRotationNumber(
+    u.shadowRotationExecutableRecoveryMaxSpacingSeconds,
+    SHADOW_ROTATION_POLICY.executableRecoveryMaxSpacingMs / 1000,
+    20,
+    30,
+  ) * 1000),
   monitorIntervalSeconds: Math.round(boundedShadowRotationNumber(
     u.shadowRotationMonitorIntervalSeconds,
     SHADOW_ROTATION_POLICY.monitorIntervalSeconds,
@@ -775,11 +851,16 @@ export const config = {
     candidateConfirmationCount: shadowRotationActive ? shadowRotationConfig.confirmationCount : Math.max(1, Number(u.candidateConfirmationCount ?? 2)),
     candidateConfirmationMaxAgeMinutes: shadowRotationActive ? shadowRotationConfig.confirmationWindowMs / 60_000 : Math.max(1, Number(u.candidateConfirmationMaxAgeMinutes ?? 15)),
     candidateConfirmationMinSpacingMinutes: shadowRotationActive ? shadowRotationConfig.confirmationSpacingMs / 60_000 : Math.max(0, Number(u.candidateConfirmationMinSpacingMinutes ?? 2)),
+    candidateInstabilityRecoveryMinutes: shadowRotationActive ? shadowRotationConfig.instabilityRecoveryDwellMs / 60_000 : Math.max(0, Number(u.candidateInstabilityRecoveryMinutes ?? 0)),
     candidateMinFeeRetentionPct: shadowRotationActive ? shadowRotationConfig.minRetentionPct : Math.max(0, Number(u.candidateMinFeeRetentionPct ?? 70)),
     candidateMinVolumeRetentionPct: shadowRotationActive ? shadowRotationConfig.minRetentionPct : Math.max(0, Number(u.candidateMinVolumeRetentionPct ?? 70)),
     candidatePriceStabilityEnabled: shadowRotationActive,
     candidateMaxPriceDrawdownPct: shadowRotationActive ? shadowRotationConfig.maxPriceDrawdownPct : null,
     candidateMaxDownsideBinDelta: shadowRotationActive ? shadowRotationConfig.maxDownsideBinDelta : null,
+    candidateAdmissionRecoveryMinutes: shadowRotationActive ? shadowRotationConfig.admissionRecoveryDwellMs / 60_000 : Math.max(0, Number(u.candidateAdmissionRecoveryMinutes ?? 0)),
+    candidateExecutableRecoveryConfirmationCount: shadowRotationActive ? shadowRotationConfig.executableRecoveryConfirmationCount : Math.max(1, Number(u.candidateExecutableRecoveryConfirmationCount ?? 1)),
+    candidateExecutableRecoverySpacingSeconds: shadowRotationActive ? shadowRotationConfig.executableRecoverySpacingMs / 1000 : Math.max(0, Number(u.candidateExecutableRecoverySpacingSeconds ?? 0)),
+    candidateExecutableRecoveryMaxSpacingSeconds: shadowRotationActive ? shadowRotationConfig.executableRecoveryMaxSpacingMs / 1000 : Math.max(0, Number(u.candidateExecutableRecoveryMaxSpacingSeconds ?? 0)),
     requireDisabledMintAuthority: u.requireDisabledMintAuthority ?? true,
     requireDisabledFreezeAuthority: u.requireDisabledFreezeAuthority ?? true,
     deploySnapshotMaxAgeMinutes: Math.max(1, Number(u.deploySnapshotMaxAgeMinutes ?? 2)),
@@ -809,6 +890,9 @@ export const config = {
     badOutcomeCooldownScope: u.badOutcomeCooldownScope ?? "both", // pool | token | both
     lowYieldCooldownHours: u.lowYieldCooldownHours ?? 4,
     stopLossCooldownHours: u.stopLossCooldownHours ?? 12,
+    settlementSmallLossFloorPct: Number(u.settlementSmallLossFloorPct ?? -0.75),
+    settlementSmallLossCooldownMinutes: Math.max(0, Number(u.settlementSmallLossCooldownMinutes ?? 60)),
+    settlementSmallLossCooldownScope: u.settlementSmallLossCooldownScope ?? "pool",
     shadowStopLossCooldownForRun: u.shadowStopLossCooldownForRun ?? true,
     shadowOutOfRangeCooldownHours: Math.max(0, Number(u.shadowOutOfRangeCooldownHours ?? 3)),
     minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
@@ -1028,6 +1112,8 @@ export const config = {
     maxBurnClosePerBatch: 10,
     maxCloseOnlyPerBatch: 20,
     maxSerializedBytes: 1_100,
+    confirmationReads: Math.max(1, Math.min(3, Math.round(Number(u.cleanupConfirmationReads ?? 2)))),
+    confirmationDelayMs: Math.max(0, Math.min(5_000, Math.round(Number(u.cleanupConfirmationDelayMs ?? 500)))),
   },
 
   circuitBreaker: {
@@ -1078,6 +1164,7 @@ export const config = {
     source: nonEmptyString(u.pnlSource, "rpc"), // rpc | meteora (fallback-only)
     pollIntervalSec: Number(u.pnlPollIntervalSec ?? 3),
     depositCacheTtlSec: Number(u.pnlDepositCacheTtlSec ?? 300),
+    executableQuoteTtlSec: Math.max(1, Number(u.pnlExecutableQuoteTtlSec ?? 6)),
     // Consecutive confirming polls required before a peak is raised or an exit fires.
     // At a 3s poll cadence, 2 ticks ≈ 3-6s — filters single-tick noise without the
     // old fixed 15s setTimeout recheck.
@@ -1147,6 +1234,10 @@ export const config = {
     entryRejectAboveUpperBand: indicatorUserConfig.entryRejectAboveUpperBand ?? true,
     requireAllIntervals: indicatorUserConfig.requireAllIntervals ?? false,
     hardFilter: indicatorUserConfig.hardFilter ?? false,
+    cacheTtl5mSec: indicatorCacheTtl5mSec,
+    cacheTtl15mSec: indicatorCacheTtl15mSec,
+    staleIfError5mSec: indicatorStaleIfError5mSec,
+    staleIfError15mSec: indicatorStaleIfError15mSec,
   },
 };
 
@@ -1257,6 +1348,7 @@ export function reloadScreeningThresholds() {
     if (fresh.candidateConfirmationCount != null) s.candidateConfirmationCount = Math.max(1, Number(fresh.candidateConfirmationCount));
     if (fresh.candidateConfirmationMaxAgeMinutes != null) s.candidateConfirmationMaxAgeMinutes = Math.max(1, Number(fresh.candidateConfirmationMaxAgeMinutes));
     if (fresh.candidateConfirmationMinSpacingMinutes != null) s.candidateConfirmationMinSpacingMinutes = Math.max(0, Number(fresh.candidateConfirmationMinSpacingMinutes));
+    if (fresh.candidateInstabilityRecoveryMinutes != null) s.candidateInstabilityRecoveryMinutes = Math.max(0, Number(fresh.candidateInstabilityRecoveryMinutes));
     if (fresh.candidateMinFeeRetentionPct != null) s.candidateMinFeeRetentionPct = Math.max(0, Number(fresh.candidateMinFeeRetentionPct));
     if (fresh.candidateMinVolumeRetentionPct != null) s.candidateMinVolumeRetentionPct = Math.max(0, Number(fresh.candidateMinVolumeRetentionPct));
     if (config.shadowRotation.enabled) {
@@ -1277,6 +1369,7 @@ export function reloadScreeningThresholds() {
       s.candidateConfirmationCount = config.shadowRotation.confirmationCount;
       s.candidateConfirmationMaxAgeMinutes = config.shadowRotation.confirmationWindowMs / 60_000;
       s.candidateConfirmationMinSpacingMinutes = config.shadowRotation.confirmationSpacingMs / 60_000;
+      s.candidateInstabilityRecoveryMinutes = config.shadowRotation.instabilityRecoveryDwellMs / 60_000;
       s.candidateMinFeeRetentionPct = config.shadowRotation.minRetentionPct;
       s.candidateMinVolumeRetentionPct = config.shadowRotation.minRetentionPct;
       config.strategy.regimeHighVolAction = "deploy";

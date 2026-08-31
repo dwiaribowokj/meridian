@@ -7,6 +7,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-executor-canary-boun
 process.env.MERIDIAN_USER_CONFIG_FILE = path.join(tmp, "user-config.json");
 process.env.MERIDIAN_STATE_FILE = path.join(tmp, "state.json");
 process.env.MERIDIAN_LESSONS_FILE = path.join(tmp, "lessons.json");
+process.env.CANDIDATE_OBSERVATIONS_PATH = path.join(tmp, "candidate-observations.json");
 fs.writeFileSync(process.env.MERIDIAN_USER_CONFIG_FILE, JSON.stringify({
   dryRun: true,
   rolloutMode: "dry_run",
@@ -41,6 +42,8 @@ try {
     applySuccessfulCloseLifecyclePostEffects,
     applyClaimLifecyclePostEffects,
     checkExecutableClaimAttribution,
+    validateExecutableDeployLiquidity,
+    validateRecoveredExecutableDeployLiquidity,
     lifecycleReceiptTransactions,
     deployReceiptSignatures,
     finalizeLifecycleToolResult,
@@ -74,6 +77,90 @@ try {
     /canary: config\.rollout\.mode !== "adaptive"/,
     "dry_run must not be misclassified as a live canary sizing request",
   );
+
+  const admissionQuotes = [];
+  const executableAdmission = await validateExecutableDeployLiquidity({
+    baseMint: "AdmissionMint",
+    amountSol: 0.2,
+    maxPriceImpactBps: 100,
+    maxRoundTripLossPct: 1,
+    slippageBps: 25,
+    now: () => 1_000,
+    quoteSwap: async (request) => {
+      admissionQuotes.push(request);
+      return admissionQuotes.length === 1
+        ? { routeFound: true, worstOutLamports: "1000000", worstNetLamports: "995000", networkFeeLamports: "5000", priceImpactBps: "10" }
+        : { routeFound: true, worstOutLamports: "199000000", worstNetLamports: "198000000", networkFeeLamports: "1000000", priceImpactBps: "20" };
+    },
+  });
+  assert.equal(executableAdmission.pass, true);
+  assert.equal(executableAdmission.entryExecutableLiquidity.roundTripLossBps, 100);
+  assert.equal(executableAdmission.entryExecutableLiquidity.quoteSlippageBps, 25);
+  assert.equal(admissionQuotes.length, 2, "admission models SOL-to-token inventory and quotes that exact inventory back to SOL");
+  assert.ok(admissionQuotes.every((request) => request.slippage_bps === 25));
+
+  const noExecutableSell = await validateExecutableDeployLiquidity({
+    baseMint: "AdmissionMint",
+    amountSol: 0.2,
+    quoteSwap: async (request) => request.input_mint === "AdmissionMint"
+      ? { routeFound: false, error: "no sell depth" }
+      : { routeFound: true, worstOutLamports: "1000000", worstNetLamports: "995000", networkFeeLamports: "5000", priceImpactBps: "10" },
+  });
+  assert.equal(noExecutableSell.pass, false);
+  assert.equal(noExecutableSell.code, "EXECUTABLE_SELL_ROUTE_UNAVAILABLE");
+
+  const { recordCandidateAdmissionFailure, getCandidateAdmissionRecovery } = await import("../candidate-observations.js");
+  const recoveryScreening = {
+    candidateAdmissionRecoveryMinutes: 5,
+    candidateExecutableRecoveryConfirmationCount: 2,
+    candidateExecutableRecoverySpacingSeconds: 25,
+    candidateExecutableRecoveryMaxSpacingSeconds: 30,
+  };
+  let recoveryClock = 10_000;
+  recordCandidateAdmissionFailure("RecoveryPool", {
+    code: "EXECUTABLE_ROUND_TRIP_LOSS_ABOVE_MAXIMUM",
+    reason: "thin route",
+  }, recoveryScreening, recoveryClock);
+  recoveryClock += 5 * 60_000;
+  let recoveryQuoteCalls = 0;
+  const recoveredAdmission = await validateRecoveredExecutableDeployLiquidity({
+    poolAddress: "RecoveryPool",
+    baseMint: "RecoveryMint",
+    amountSol: 0.2,
+    screening: recoveryScreening,
+    now: () => recoveryClock,
+    wait: async (ms) => { recoveryClock += ms; },
+    validateQuote: async () => ({
+      pass: true,
+      entryExecutableLiquidity: {
+        quotedAtMs: recoveryClock,
+        roundTripLossBps: 70 + recoveryQuoteCalls++,
+        recoveryBps: 9930,
+        buy: { priceImpactBps: 0 },
+        sell: { priceImpactBps: 0 },
+      },
+    }),
+  });
+  assert.equal(recoveredAdmission.pass, true);
+  assert.equal(recoveryQuoteCalls, 2);
+  assert.equal(recoveredAdmission.entryExecutableLiquidity.recoveryConfirmation.quoteCount, 2);
+  assert.equal(recoveredAdmission.entryExecutableLiquidity.recoveryConfirmation.requestedSpacingMs, 25_000);
+  assert.equal(getCandidateAdmissionRecovery("RecoveryPool", recoveryScreening, recoveryClock).required, false);
+
+  let ordinaryQuoteCalls = 0;
+  const ordinaryAdmission = await validateRecoveredExecutableDeployLiquidity({
+    poolAddress: "OrdinaryPool",
+    baseMint: "OrdinaryMint",
+    amountSol: 0.2,
+    screening: recoveryScreening,
+    now: () => recoveryClock,
+    validateQuote: async () => {
+      ordinaryQuoteCalls += 1;
+      return { pass: true, entryExecutableLiquidity: { quotedAtMs: recoveryClock } };
+    },
+  });
+  assert.equal(ordinaryAdmission.pass, true);
+  assert.equal(ordinaryQuoteCalls, 1, "ordinary admission remains single-quote");
   const breakerCall = executorSource.indexOf("const breakerCheck = await checkDeployCircuitBreaker();");
   const canaryCall = executorSource.indexOf("return withCanaryDeployReservation({");
   assert.ok(
@@ -609,6 +696,12 @@ try {
     args: { pool_address: "ignored-pool", amount_y: 0.1 },
     dependencies: {
       getWalletPublicKey: () => "wallet-public-key",
+      getTrackedPosition: () => ({
+        pool_name: "LedgerToken-SOL",
+        base_mint: "ledger-token-mint",
+        strategy: "spot",
+        deployed_at: "2026-08-28T00:00:00.000Z",
+      }),
       recordDeployLifecycle: async (input) => {
         deployRecorderInputs.push(input);
         return { state: "ACTIVE", lifecycle_id: "lp:ledger-recorded-deploy" };
@@ -623,7 +716,16 @@ try {
     layers: [],
     txs: ["ledger-recorded-signature"],
     walletAddress: "wallet-public-key",
-    metadata: { relay: false, result_reconciliation_required: false },
+    metadata: {
+      relay: false,
+      result_reconciliation_required: false,
+      pool_name: "LedgerToken-SOL",
+      base_mint: "ledger-token-mint",
+      strategy: "spot",
+      strategy_profile: null,
+      deployed_at: "2026-08-28T00:00:00.000Z",
+      entry_executable_liquidity: null,
+    },
     allowActivation: true,
   });
   assert.equal(successfulDeploy.ledger.state, "ACTIVE");

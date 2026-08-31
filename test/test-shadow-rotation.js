@@ -19,6 +19,7 @@ const {
   isAuthorizedRotationRange,
   minimumBinsBelowForStrategyProfile,
   resolveEntryStrategyProfile,
+  resolveShadowRotationRange,
   SHADOW_ROTATION_POLICY,
   SHADOW_ROTATION_STRATEGY_PROFILE,
   YIELD_HOLD_STRATEGY_PROFILE,
@@ -59,20 +60,39 @@ const rotation = {
   maxPriceDrawdownPct: 1.5,
   maxDownsideBinDelta: 2,
   maxPositionActiveTvlPct: 2,
-  minEntryRsi15m: 40,
+  minEntryRsi15m: 35,
   maxEntryRsi5m: 75,
   maxEntryRsi15m: 80,
   feeParticipationPct: 75,
   estimatedRoundTripCostPct: 0.4,
   minimumProjectedNetFeePct: 0.1,
   maxHoldMinutes: 90,
-  maxVolatilityExclusive: 7.5,
+  maxVolatilityExclusive: 4.5,
+  mediumVolatilityMin: 3.5,
+  mediumVolatilityBinsBelow: 6,
+  mediumVolatilityBinsAbove: 2,
 };
 assert.equal(SHADOW_ROTATION_STRATEGY_PROFILE, "rotation_live_v1");
 assert.equal(SHADOW_ROTATION_POLICY.fundingModel, "single_side_sol");
 assert.equal(SHADOW_ROTATION_POLICY.binsBelow, 4);
 assert.equal(SHADOW_ROTATION_POLICY.binsAbove, 1);
+assert.equal(SHADOW_ROTATION_POLICY.entryExecutableQuoteSlippageBps, 25);
 assert.equal(SHADOW_ROTATION_POLICY.normalStopGraceMinutes, 0);
+assert.deepEqual(resolveShadowRotationRange(3.49, SHADOW_ROTATION_POLICY), {
+  eligible: true,
+  regime: "low_volatility",
+  volatility: 3.49,
+  binsBelow: 4,
+  binsAbove: 1,
+});
+assert.deepEqual(resolveShadowRotationRange(3.5, SHADOW_ROTATION_POLICY), {
+  eligible: true,
+  regime: "medium_volatility",
+  volatility: 3.5,
+  binsBelow: 6,
+  binsAbove: 2,
+});
+assert.equal(resolveShadowRotationRange(4.5, SHADOW_ROTATION_POLICY).eligible, false);
 
 const feeWindowCache = new Map();
 let feeWindowFetches = 0;
@@ -137,7 +157,7 @@ const policy = candidatePolicyFromScreening({
   maxTop10Pct: 30,
   minTokenAgeHours: 1,
   minTokenFeesSol: 80,
-  maxVolatility: 7.5,
+  maxVolatility: 4.5,
   candidateConfirmationCount: 3,
   candidateConfirmationMinSpacingMinutes: 0.5,
   candidateConfirmationMaxAgeMinutes: 5,
@@ -152,14 +172,14 @@ const policy = candidatePolicyFromScreening({
 
 assert.equal(policy.candidate.strategyProfile, SHADOW_ROTATION_STRATEGY_PROFILE);
 assert.equal(policy.candidate.minFeeActiveTvlRatioPct, 1.0);
-assert.equal(policy.candidate.minEntryRsi15m, 40);
+assert.equal(policy.candidate.minEntryRsi15m, 35);
 assert.equal(policy.candidate.maxEntryRsi5m, 75);
 assert.equal(policy.candidate.minVolumeUsd, 250);
 assert.equal(policy.candidate.minActiveTvlUsd, 400);
 assert.equal(policy.candidate.minMarketCapUsd, 50_000);
 assert.equal(policy.candidate.minHolderCount, 500);
 assert.equal(policy.candidate.maxBotHolderPct, 25);
-assert.equal(policy.candidate.maxVolatilityExclusive, 7.5);
+assert.equal(policy.candidate.maxVolatilityExclusive, 4.5);
 assert.equal(policy.candidate.maxTokenAgeHours, 72);
 assert.equal(policy.candidate.requiredObservationCount, 3);
 assert.equal(policy.candidate.minObservationSpacingMs, 30_000);
@@ -207,7 +227,7 @@ assert.ok(evaluateEntryMomentum({
 }, policy).reasons.includes("FIVE_MINUTE_RSI_ABOVE_MAXIMUM"));
 assert.ok(evaluateEntryMomentum({
   ...trendContinuation,
-  momentum15m: { ...trendContinuation.momentum15m, rsi: 39.99 },
+  momentum15m: { ...trendContinuation.momentum15m, rsi: 34.99 },
 }, policy).reasons.includes("FIFTEEN_MINUTE_RSI_BELOW_RECOVERY_MINIMUM"));
 const yieldPolicy = candidatePolicyFromScreening({}, { management: {}, indicators: {} });
 assert.equal(evaluateEntryMomentum(trendContinuation, yieldPolicy).eligible, false);
@@ -276,10 +296,10 @@ assert.ok(evaluateCandidate({ ...tuckerClassCandidate, tokenAgeHours: 311 }, { n
 assert.ok(evaluateCandidate({ ...tuckerClassCandidate, feeActiveTvlRatioPct: 0.999 }, { nowMs: 60_000 }, policy)
   .reasons.includes("FEE_ACTIVE_TVL_RATIO_BELOW_MINIMUM"));
 assert.equal(
-  evaluateCandidate({ ...tuckerClassCandidate, volatility: 7.49 }, { nowMs: 60_000 }, policy).eligible,
+  evaluateCandidate({ ...tuckerClassCandidate, volatility: 4.49 }, { nowMs: 60_000 }, policy).eligible,
   true,
 );
-assert.ok(evaluateCandidate({ ...tuckerClassCandidate, volatility: 7.5 }, { nowMs: 60_000 }, policy)
+assert.ok(evaluateCandidate({ ...tuckerClassCandidate, volatility: 4.5 }, { nowMs: 60_000 }, policy)
   .reasons.includes("VOLATILITY_OUT_OF_RANGE"));
 assert.ok(evaluateCandidate({
   ...tuckerClassCandidate,
@@ -306,7 +326,9 @@ const recentOutcomeCalibration = [
   { name: "Doom", won: false, expectedEligible: true, fee: 1.2495147565, rsi5m: 56.0182, rsi15m: 52.0098 },
   { name: "FROGE", won: false, expectedEligible: false, fee: 0.5043524175, rsi5m: 78.5181, rsi15m: 52.874 },
   { name: "BUTTHOLE", won: false, expectedEligible: false, fee: 0.7247425299, rsi5m: 76.1887, rsi15m: 77.2289 },
-  { name: "ICM", won: false, expectedEligible: false, fee: 1.9247186271, rsi5m: 58.691, rsi15m: 37.4011 },
+  // The relaxed 15m recovery floor admits this historical false-positive;
+  // price stability and exit controls remain responsible for containing it.
+  { name: "ICM", won: false, expectedEligible: true, fee: 1.9247186271, rsi5m: 58.691, rsi15m: 37.4011 },
 ];
 for (const outcome of recentOutcomeCalibration) {
   const evaluation = evaluateCandidate({
@@ -354,6 +376,7 @@ const authorizedLiveRotationRange = {
   strategy: "spot",
   binsBelow: 4,
   binsAbove: 1,
+  volatility: 3,
   rotationStrategy: "spot",
   rotationBinsBelow: 4,
   rotationBinsAbove: 1,
@@ -365,6 +388,16 @@ assert.equal(isAuthorizedRotationRange({ ...authorizedLiveRotationRange, strateg
 assert.equal(isAuthorizedRotationRange({ ...authorizedLiveRotationRange, strategy: "bid_ask" }), false);
 assert.equal(isAuthorizedRotationRange({ ...authorizedLiveRotationRange, binsBelow: 5 }), false);
 assert.equal(isAuthorizedRotationRange({ ...authorizedLiveRotationRange, binsAbove: 0 }), false);
+assert.equal(isAuthorizedRotationRange({
+  ...authorizedLiveRotationRange,
+  volatility: 3.7,
+  binsBelow: 6,
+  binsAbove: 2,
+  rotationMediumVolatilityMin: 3.5,
+  rotationMediumBinsBelow: 6,
+  rotationMediumBinsAbove: 2,
+  rotationMaxVolatilityExclusive: 4.5,
+}), true);
 assert.equal(isAuthorizedRotationRange({
   ...authorizedLiveRotationRange,
   binsBelow: 4,
@@ -409,6 +442,19 @@ const paperId = trackPaperPosition({
     strategyProfile: SHADOW_ROTATION_STRATEGY_PROFILE,
     fundingModel: "single_side_sol",
     entryEconomics: calculateEntryFeeEconomics({ timeframeMinutes: 30, feeActiveTvlRatioPct: 1.98 }, policy),
+    entryExecutableLiquidity: {
+      source: "jupiter_swap_v2_quote",
+      baseMint,
+      quotedAtMs: startedAt,
+      inputSolLamports: "200000000",
+      modeledTokenRaw: "123456",
+      executableRecoveryLamports: "198000000",
+      recoveryBps: 9900,
+      roundTripLossBps: 100,
+      buy: { routeFound: true, worstOutRaw: "123456", priceImpactBps: 10 },
+      sell: { routeFound: true, worstOutRaw: "199000000", worstNetLamports: "198000000", priceImpactBps: 20 },
+      rawOrder: { transaction: "must-not-be-persisted" },
+    },
     observations: tuckerClassCandidate.observations,
   },
   nowMs: startedAt,
@@ -650,6 +696,8 @@ const snapshot = getShadowRolloutEvidenceSnapshot();
 assert.equal(snapshot.strategy_profile, SHADOW_ROTATION_STRATEGY_PROFILE);
 assert.equal(snapshot.lifecycles[0].entry.policy_snapshot.observations.length, 3);
 assert.equal(snapshot.lifecycles[0].entry.policy_snapshot.observations[2].priceValue, 1.006);
+assert.equal(snapshot.lifecycles[0].entry.policy_snapshot.entryExecutableLiquidity.executableRecoveryLamports, "198000000");
+assert.equal(Object.hasOwn(snapshot.lifecycles[0].entry.policy_snapshot.entryExecutableLiquidity, "rawOrder"), false);
 const evidencePath = path.join(tempDir, "rotation-evidence.jsonl");
 appendShadowEvidenceHeartbeat({
   filePath: evidencePath,

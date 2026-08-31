@@ -10,10 +10,11 @@ import {
   registerLiveClaimExecutionCapability,
   searchPools,
 } from "./dlmm.js";
-import { getWalletBalances, getWalletPublicKey, swapToken } from "./wallet.js";
+import { getWalletBalances, getWalletPublicKey, quoteTokenSwap, swapToken } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
-import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { getTrackedPositions, recordCloseSolMetrics, setPositionInstruction } from "../state.js";
+import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, pinLesson, unpinLesson, listLessons } from "../lessons.js";
+import { getTrackedPosition, getTrackedPositions, recordCloseSolMetrics, setPositionInstruction } from "../state.js";
+import { getSettlementPerformanceHistory } from "../settlement-report.js";
 
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
@@ -34,7 +35,12 @@ import fs from "fs";
 import { execSync, spawn } from "child_process";
 import { REPO_ROOT, repoPath } from "../repo-root.js";
 import { normalizeTimeframe, scaleScreeningToTimeframe } from "../screening-scales.js";
-import { validateCandidateStability } from "../candidate-observations.js";
+import {
+  clearCandidateAdmissionRecovery,
+  getCandidateAdmissionRecovery,
+  recordCandidateAdmissionFailure,
+  validateCandidateStability,
+} from "../candidate-observations.js";
 import { confirmStrictEntryMomentum } from "./chart-indicators.js";
 import {
   calculateAdaptiveSizing,
@@ -42,6 +48,7 @@ import {
   evaluateCandidate,
   isAuthorizedRotationRange,
   minimumBinsBelowForStrategyProfile,
+  resolveShadowRotationRange,
   SHADOW_ROTATION_STRATEGY_PROFILE,
 } from "../risk-policy.js";
 import {
@@ -84,6 +91,10 @@ const TIMEFRAME_MINUTES = {
 };
 import { log, logAction } from "../logger.js";
 import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
+import {
+  collectExecutableRoundTripEvidence,
+  solAmountToLamports,
+} from "../executable-liquidity.js";
 
 function numberOrNull(value) {
   const n = Number(value);
@@ -138,6 +149,153 @@ async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.ti
   if (!res.ok) throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
   const data = await res.json();
   return (data?.data || [])[0] ?? null;
+}
+
+export async function validateExecutableDeployLiquidity({
+  baseMint,
+  amountSol,
+  quoteSwap = quoteTokenSwap,
+  now = Date.now,
+  slippageBps = config.shadowRotation?.entryExecutableQuoteSlippageBps ?? 25,
+  maxPriceImpactBps = config.shadowRotation?.maxEntryExecutablePriceImpactBps ?? 100,
+  maxRoundTripLossPct = config.shadowRotation?.maxEntryExecutableRoundTripLossPct ?? 1,
+} = {}) {
+  let deployLamports;
+  try {
+    deployLamports = solAmountToLamports(amountSol);
+  } catch (error) {
+    return { pass: false, reason: `Executable admission amount is invalid: ${error.message}` };
+  }
+
+  const stopLossPct = Number(config.management?.stopLossPct);
+  const stopBudgetPct = Number.isFinite(stopLossPct) && stopLossPct < 0
+    ? Math.abs(stopLossPct)
+    : Number(maxRoundTripLossPct);
+  const effectiveMaxRoundTripLossPct = Math.min(
+    Math.max(0, Number(maxRoundTripLossPct)),
+    Math.max(0, stopBudgetPct),
+  );
+  const assessment = await collectExecutableRoundTripEvidence({
+    baseMint,
+    deployLamports,
+    quoteSwap,
+    solMint: config.tokens.SOL,
+    slippageBps,
+    maxPriceImpactBps,
+    maxRoundTripLossPct: effectiveMaxRoundTripLossPct,
+    now,
+  });
+  if (!assessment.pass) {
+    return {
+      pass: false,
+      reason: assessment.reason || "Executable admission liquidity could not be confirmed.",
+      code: assessment.code,
+      entryExecutableLiquidity: assessment.evidence || null,
+    };
+  }
+  return {
+    pass: true,
+    entryExecutableLiquidity: {
+      ...assessment.evidence,
+      baseMint,
+      deployAmountSol: Number(amountSol),
+    },
+  };
+}
+
+function compactExecutableQuoteConfirmation(evidence = {}) {
+  return {
+    quotedAtMs: numberOrNull(evidence.quotedAtMs),
+    roundTripLossBps: numberOrNull(evidence.roundTripLossBps),
+    recoveryBps: numberOrNull(evidence.recoveryBps),
+    buyPriceImpactBps: numberOrNull(evidence.buy?.priceImpactBps),
+    sellPriceImpactBps: numberOrNull(evidence.sell?.priceImpactBps),
+  };
+}
+
+export async function validateRecoveredExecutableDeployLiquidity({
+  poolAddress,
+  baseMint,
+  amountSol,
+  screening = config.screening,
+  validateQuote = validateExecutableDeployLiquidity,
+  wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now = Date.now,
+} = {}) {
+  const recovery = getCandidateAdmissionRecovery(poolAddress, screening, now());
+  if (recovery.required && !recovery.pass) {
+    return {
+      pass: false,
+      code: "ADMISSION_RECOVERY_DWELL_ACTIVE",
+      reason: `Candidate admission recovery remains blocked for ${Math.ceil(recovery.remainingMs / 1000)}s after ${recovery.code}.`,
+      recovery,
+    };
+  }
+
+  const quoteCount = recovery.required ? Math.max(2, recovery.quoteConfirmationCount) : 1;
+  const confirmations = [];
+  let previousQuoteAtMs = null;
+  let latest = null;
+  for (let index = 0; index < quoteCount; index++) {
+    if (index > 0) {
+      await wait(recovery.quoteSpacingMs);
+      const resumedAtMs = now();
+      const elapsedMs = resumedAtMs - previousQuoteAtMs;
+      if (elapsedMs > recovery.quoteMaxSpacingMs) {
+        recordCandidateAdmissionFailure(poolAddress, {
+          code: "EXECUTABLE_RECOVERY_SPACING_EXPIRED",
+          reason: `Executable recovery confirmation spacing ${elapsedMs}ms exceeded ${recovery.quoteMaxSpacingMs}ms.`,
+        }, screening, resumedAtMs);
+        return {
+          pass: false,
+          code: "EXECUTABLE_RECOVERY_SPACING_EXPIRED",
+          reason: "Executable recovery confirmation window expired; the recovery dwell restarted.",
+        };
+      }
+    }
+
+    latest = await validateQuote({ baseMint, amountSol, now });
+    const quotedAtMs = numberOrNull(latest?.entryExecutableLiquidity?.quotedAtMs) ?? now();
+    if (!latest?.pass) {
+      recordCandidateAdmissionFailure(poolAddress, {
+        code: latest?.code || "EXECUTABLE_QUOTE_FAILED",
+        reason: latest?.reason || "Executable admission quote failed.",
+      }, screening, quotedAtMs);
+      return latest;
+    }
+    if (previousQuoteAtMs != null) {
+      const actualSpacingMs = quotedAtMs - previousQuoteAtMs;
+      if (actualSpacingMs < recovery.quoteSpacingMs || actualSpacingMs > recovery.quoteMaxSpacingMs) {
+        recordCandidateAdmissionFailure(poolAddress, {
+          code: "EXECUTABLE_RECOVERY_SPACING_EXPIRED",
+          reason: `Executable recovery quote spacing ${actualSpacingMs}ms was outside ${recovery.quoteSpacingMs}-${recovery.quoteMaxSpacingMs}ms.`,
+        }, screening, quotedAtMs);
+        return {
+          pass: false,
+          code: "EXECUTABLE_RECOVERY_SPACING_EXPIRED",
+          reason: "Executable recovery quote spacing left the configured 20-30 second window; the recovery dwell restarted.",
+        };
+      }
+    }
+    confirmations.push(compactExecutableQuoteConfirmation(latest.entryExecutableLiquidity));
+    previousQuoteAtMs = quotedAtMs;
+  }
+
+  if (recovery.required) clearCandidateAdmissionRecovery(poolAddress);
+  return {
+    ...latest,
+    entryExecutableLiquidity: {
+      ...latest.entryExecutableLiquidity,
+      recoveryConfirmation: {
+        required: recovery.required,
+        previousFailureAtMs: recovery.lastFailureAt ?? null,
+        previousFailureCode: recovery.code ?? null,
+        quoteCount: confirmations.length,
+        requestedSpacingMs: recovery.required ? recovery.quoteSpacingMs : 0,
+        confirmations,
+      },
+    },
+  };
 }
 
 async function validateDeployPoolThresholds(args) {
@@ -218,6 +376,11 @@ async function validateDeployPoolThresholds(args) {
 
   const volatility = poolDetailVolatility(volatilityDetail);
   if (volatility == null || volatility <= 0) {
+    recordCandidateAdmissionFailure(args.pool_address, {
+      code: "VOLATILITY_OUT_OF_RANGE",
+      reason: `Volatility ${volatility ?? "unknown"} is unusable.`,
+      volatility,
+    }, config.screening);
     return {
       pass: false,
       reason: `Pool ${volatilityTimeframe} volatility ${volatility ?? "unknown"} is unusable. Refusing deploy.`,
@@ -234,18 +397,32 @@ async function validateDeployPoolThresholds(args) {
   }
   const maxVolatility = numberOrNull(config.screening.maxVolatility);
   if (maxVolatility != null && maxVolatility > 0 && volatility >= maxVolatility) {
+    recordCandidateAdmissionFailure(args.pool_address, {
+      code: "VOLATILITY_OUT_OF_RANGE",
+      reason: `Volatility ${volatility} is at or above the ${maxVolatility} deployment cap.`,
+      volatility,
+    }, config.screening);
     return {
       pass: false,
       reason: `Pool ${volatilityTimeframe} volatility ${volatility} is at/above configured maxVolatility ${maxVolatility}.`,
     };
   }
+  const admissionRecovery = getCandidateAdmissionRecovery(args.pool_address, config.screening);
+  if (admissionRecovery.required && !admissionRecovery.pass) {
+    return {
+      pass: false,
+      code: "ADMISSION_RECOVERY_DWELL_ACTIVE",
+      reason: `Candidate admission recovery remains blocked for ${Math.ceil(admissionRecovery.remainingMs / 1000)}s after ${admissionRecovery.code}.`,
+    };
+  }
 
+  const currentPrice = poolDetailPrice(detail);
   const confirmation = validateCandidateStability(
     args.pool_address,
     {
       feeActiveTvlRatio,
       volume,
-      price: poolDetailPrice(detail),
+      price: currentPrice,
       binStep: poolDetailBinStep(detail),
     },
     config.screening,
@@ -377,8 +554,48 @@ async function validateDeployPoolThresholds(args) {
     return { pass: false, reason: `Fresh deterministic deploy gates failed: ${policyEvaluation.reasons.join(", ")}` };
   }
   freshPolicySnapshot.entryEconomics = policyEvaluation.economics;
+  if (requestedStrategyProfile === SHADOW_ROTATION_STRATEGY_PROFILE) {
+    const freshRange = resolveShadowRotationRange(volatility, config.shadowRotation);
+    if (!freshRange.eligible) {
+      recordCandidateAdmissionFailure(args.pool_address, {
+        code: "VOLATILITY_OUT_OF_RANGE",
+        reason: freshRange.reason,
+        volatility,
+      }, config.screening);
+      return { pass: false, code: "VOLATILITY_OUT_OF_RANGE", reason: freshRange.reason };
+    }
+    const requestedBinsBelow = Number(args.bins_below);
+    const requestedBinsAbove = Number(args.bins_above);
+    if (requestedBinsBelow !== freshRange.binsBelow || requestedBinsAbove !== freshRange.binsAbove) {
+      return {
+        pass: false,
+        code: "ROTATION_RANGE_REGIME_CHANGED",
+        reason: `Fresh volatility ${volatility} now requires ${freshRange.binsBelow}+${freshRange.binsAbove} bins; screening selected ${requestedBinsBelow}+${requestedBinsAbove}.`,
+      };
+    }
+    freshPolicySnapshot.rangeRegime = freshRange.regime;
+    freshPolicySnapshot.rangeBinsBelow = freshRange.binsBelow;
+    freshPolicySnapshot.rangeBinsAbove = freshRange.binsAbove;
+  }
+
+  const executableLiquidity = await validateRecoveredExecutableDeployLiquidity({
+    poolAddress: args.pool_address,
+    baseMint,
+    amountSol: args.amount_y ?? args.amount_sol,
+  });
+  if (!executableLiquidity.pass) {
+    return {
+      pass: false,
+      reason: executableLiquidity.reason,
+      code: executableLiquidity.code,
+      entryExecutableLiquidity: executableLiquidity.entryExecutableLiquidity,
+    };
+  }
+  freshPolicySnapshot.entryExecutableLiquidity = executableLiquidity.entryExecutableLiquidity;
 
   const entryMarketData = {
+    base_mint: baseMint,
+    volatility,
     entry_mcap: numberOrNull(detail?.token_x?.market_cap ?? detail?.base_token_market_cap),
     entry_tvl: tvl,
     entry_volume: numberOrNull(detail?.volume),
@@ -566,7 +783,7 @@ const toolMap = {
       return { success: false, error: e.message };
     }
   },
-  get_performance_history: getPerformanceHistory,
+  get_performance_history: getSettlementPerformanceHistory,
   get_recent_decisions: ({ limit } = {}) => ({ decisions: getRecentDecisions(limit || 6) }),
   add_strategy:        addStrategy,
   list_strategies:     listStrategies,
@@ -2005,6 +2222,15 @@ export async function finalizeLifecycleToolResult({
       );
     }
     try {
+      let tracked = null;
+      try {
+        tracked = (dependencies.getTrackedPosition || getTrackedPosition)(result.position);
+      } catch (error) {
+        // Receipt accounting remains authoritative even if the convenience
+        // registry is temporarily unreadable. Result/argument metadata still
+        // gives the settlement projector its best available identity.
+        log("ledger_warn", `Could not read tracked deploy identity for ${result.position}: ${error.message}`);
+      }
       const recorderInput = {
         position: result.position,
         pool: result.pool || args.pool_address,
@@ -2015,6 +2241,12 @@ export async function finalizeLifecycleToolResult({
         metadata: {
           relay: result.relay === true,
           result_reconciliation_required: result.reconciliation_required === true,
+          pool_name: tracked?.pool_name || result.pool_name || args.pool_name || null,
+          base_mint: tracked?.base_mint || tracked?.signal_snapshot?.base_mint || result.base_mint || args.base_mint || null,
+          strategy: tracked?.strategy || result.strategy || args.strategy || null,
+          strategy_profile: args.policy_snapshot?.strategyProfile || null,
+          deployed_at: tracked?.deployed_at || result.deployed_at || null,
+          entry_executable_liquidity: args.policy_snapshot?.entryExecutableLiquidity || null,
         },
         // A submitted-but-unresolved deploy may record its inspected receipts,
         // but cannot activate a lifecycle or promote a requested amount to
@@ -2509,6 +2741,8 @@ export async function executeTool(name, args = {}, dependencies = {}) {
           walletSolBeforeDeploy: result.wallet_sol_before_deploy,
           walletSolAfterClose: result.wallet_sol_after_cleanup ?? result.wallet_sol_after_close,
           walletSolRoundtripDelta: result.wallet_sol_roundtrip_delta_after_cleanup ?? result.wallet_sol_roundtrip_delta,
+          pnlSource: result.settlement_pnl_source,
+          pnlUnit: config.management.solMode ? "SOL" : "USD",
           reason: result.close_reason || workingArgs.reason,
         }).catch(() => {});
       }
@@ -2589,6 +2823,7 @@ async function runSafetyChecks(name, args, dependencies = {}) {
       }
       const requestedBinsBelow = Number(args.bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow);
       const requestedBinsAbove = Number(args.bins_above ?? config.strategy.upperBufferBins ?? 0);
+      const requestedVolatility = args.volatility == null ? null : Number(args.volatility);
       const strategyProfile = args.policy_snapshot?.strategyProfile ?? config.rollout.strategyProfile;
       const minBinsBelow = minimumBinsBelowForStrategyProfile({
         effectiveDryRun: isEffectiveDryRun(),
@@ -2608,11 +2843,15 @@ async function runSafetyChecks(name, args, dependencies = {}) {
         strategy: args.strategy,
         binsBelow: requestedBinsBelow,
         binsAbove: requestedBinsAbove,
+        volatility: requestedVolatility,
         rotationStrategy: config.shadowRotation.strategy,
         rotationBinsBelow: config.shadowRotation.binsBelow,
         rotationBinsAbove: config.shadowRotation.binsAbove,
+        rotationMediumVolatilityMin: config.shadowRotation.mediumVolatilityMin,
+        rotationMediumBinsBelow: config.shadowRotation.mediumVolatilityBinsBelow,
+        rotationMediumBinsAbove: config.shadowRotation.mediumVolatilityBinsAbove,
+        rotationMaxVolatilityExclusive: config.shadowRotation.maxVolatilityExclusive,
       });
-      const requestedVolatility = args.volatility == null ? null : Number(args.volatility);
       if (args.volatility != null && (!Number.isFinite(requestedVolatility) || requestedVolatility <= 0)) {
         return {
           pass: false,
@@ -2648,23 +2887,14 @@ async function runSafetyChecks(name, args, dependencies = {}) {
       }
       if (
         strategyProfile === SHADOW_ROTATION_STRATEGY_PROFILE &&
-        (
-          requestedBinsBelow !== config.shadowRotation.binsBelow ||
-          requestedBinsAbove !== config.shadowRotation.binsAbove
-        )
-      ) {
-        return {
-          pass: false,
-          reason: `Shadow rotation requires centered range ${config.shadowRotation.binsBelow} below + ${config.shadowRotation.binsAbove} above; received ${requestedBinsBelow}+${requestedBinsAbove}.`,
-        };
-      }
-      if (
-        strategyProfile === SHADOW_ROTATION_STRATEGY_PROFILE &&
         !authorizedRotationRange
       ) {
+        const expectedRange = resolveShadowRotationRange(requestedVolatility, config.shadowRotation);
         return {
           pass: false,
-          reason: "Shadow rotation range does not satisfy the locked executable contract (at least 4 bins below and 5 total bins).",
+          reason: expectedRange.eligible
+            ? `Shadow rotation volatility ${requestedVolatility} requires ${expectedRange.binsBelow}+${expectedRange.binsAbove} bins; received ${requestedBinsBelow}+${requestedBinsAbove}.`
+            : expectedRange.reason || "Shadow rotation range does not satisfy the executable contract.",
         };
       }
       if (

@@ -490,6 +490,7 @@ export const BOT_COMMANDS = [
   { command: "candidates", description: "Show latest cached candidates" },
   { command: "deploy",     description: "Deploy candidate by cached index" },
   { command: "briefing",   description: "Morning briefing" },
+  { command: "performance", description: "On-chain settled PnL" },
   { command: "hive",       description: "HiveMind sync status" },
   { command: "pause",      description: "Stop cron cycles" },
   { command: "resume",     description: "Start cron cycles again" },
@@ -558,6 +559,7 @@ function escapeHTML(value) {
 }
 
 function fmtSol(value) {
+  if (value == null) return null;
   const n = Number(value);
   return Number.isFinite(n) ? n.toFixed(6) : null;
 }
@@ -572,14 +574,16 @@ export async function notifyClose({
   walletSolBeforeDeploy,
   walletSolAfterClose,
   walletSolRoundtripDelta,
+  pnlSource,
+  pnlUnit = "USD",
   reason,
 }) {
   if (hasActiveLiveMessage()) return;
-  const sign = pnlUsd >= 0 ? "+" : "";
+  const settled = pnlSource === "trade_ledger_wallet_equity_net";
   const solPnl = fmtSol(pnlSol);
   const solSign = Number(pnlSol) >= 0 ? "+" : "";
   const positionLine = solPnl != null
-    ? `SOL PnL: ${solSign}◎${solPnl}${pnlPct != null ? ` (${solSign}${(pnlPct ?? 0).toFixed(2)}%)` : ""}\n`
+    ? `${settled ? "On-chain net PnL" : "Estimated net PnL"}: ${solSign}◎${solPnl}${pnlPct != null && Number.isFinite(Number(pnlPct)) ? ` (${solSign}${Number(pnlPct).toFixed(2)}%)` : ""}\n`
     : "";
   const deployed = fmtSol(positionSolDeployed);
   const final = fmtSol(positionSolFinal);
@@ -594,13 +598,24 @@ export async function notifyClose({
     ? `Wallet SOL: ◎${walletBefore} → ◎${walletAfter}${walletDelta != null ? ` (${walletSign}◎${walletDelta})` : ""}\n`
     : "";
   const reasonLine = reason ? `Reason: ${escapeHTML(reason)}\n` : "";
+  const sourceLine = settled
+    ? "PnL source: reconciled on-chain cash settlement\n"
+    : "PnL source: executable estimate; final settlement pending\n";
+  const fallbackPnl = Number(pnlUsd);
+  const fallbackSign = fallbackPnl >= 0 ? "+" : "";
+  const fallbackSymbol = pnlUnit === "SOL" ? "◎" : "$";
+  const fallbackDigits = pnlUnit === "SOL" ? 6 : 2;
+  const fallbackLine = solPnl == null && Number.isFinite(fallbackPnl)
+    ? `Estimated PnL: ${fallbackSign}${fallbackSymbol}${fallbackPnl.toFixed(fallbackDigits)}${pnlPct != null && Number.isFinite(Number(pnlPct)) ? ` (${fallbackSign}${Number(pnlPct).toFixed(2)}%)` : ""}`
+    : "";
   await sendHTML(
     `🔒 <b>Closed</b> ${escapeHTML(pair)}\n` +
     reasonLine +
+    sourceLine +
     positionLine +
     positionDetailLine +
     walletLine +
-    `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
+    fallbackLine
   );
 }
 
